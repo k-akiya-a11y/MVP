@@ -114,27 +114,18 @@ describe("判断ログは追記専用", () => {
     }
   });
 
-  it("担当者はログイン中の本人の名前でだけ確認を記録できる", async () => {
+  it("担当者は確認ログに直接書けず、更新もできない", async () => {
     await client.query("begin");
     try {
       const { decisionId } = await insertSampleDecision(client);
       await client.query("select set_config('request.jwt.claim.sub', $1, true)", [STAFF_ID]);
       await client.query("set local role authenticated");
-
-      const spoofed = await expectQueryError(
+      const insert = await expectQueryError(
         client,
         `insert into public.human_reviews (customer_id, ai_decision_id, action, reviewer_id) values ($1, $2, 'hold', $3)`,
-        [CUSTOMER_A, decisionId, ADMIN_ID],
-      );
-      expect(spoofed).toMatch(/row-level security/);
-
-      const ok = await client.query(
-        `insert into public.human_reviews (customer_id, ai_decision_id, action, final_entry, reviewer_id, review_seconds)
-         values ($1, $2, 'approve', '{"account_item_id": 101, "tax_code": 21}', $3, 4) returning id`,
         [CUSTOMER_A, decisionId, STAFF_ID],
       );
-      expect(ok.rowCount).toBe(1);
-
+      expect(insert).toMatch(/permission denied/);
       const update = await expectQueryError(client, "update public.human_reviews set action = 'reject'");
       expect(update).toMatch(/permission denied/);
     } finally {
@@ -383,4 +374,123 @@ describe("AI判断の記録", () => {
       expect(message).toMatch(/permission denied/);
     });
   });
+});
+
+describe("人の確認の記録（record_human_review）", () => {
+  const PROPOSAL = { account_item_id: 105, tax_code: 21, partner_id: 302, item_id: null, section_id: 401, tag_ids: [], description: "11月分 家賃" };
+
+  async function setup(confidence = "high", proposal: object | null = PROPOSAL) {
+    const imp = await client.query<{ id: string }>(
+      `insert into public.statement_imports (customer_id, wallet_id, source) values ($1, $2, 'csv') returning id`,
+      [CUSTOMER_A, WALLET_A],
+    );
+    const txn = await client.query<{ id: string }>(
+      `insert into public.bank_transactions (customer_id, wallet_id, import_id, txn_date, amount, direction, description, dedupe_key, status)
+       values ($1, $2, $3, '2026-10-30', 165000, 'expense', 'ｶ)ｻﾝﾌﾟﾙﾌﾄﾞｳｻﾝ', 'rv-1', 'proposed') returning id`,
+      [CUSTOMER_A, WALLET_A, imp.rows[0]!.id],
+    );
+    const decision = await client.query<{ id: string }>(
+      `insert into public.ai_decisions (customer_id, bank_transaction_id, transaction_snapshot, proposal, confidence, confidence_breakdown)
+       values ($1, $2, '{"partnerKey": "サンプルフドウサン"}', $3, $4, '{}') returning id`,
+      [CUSTOMER_A, txn.rows[0]!.id, proposal === null ? null : JSON.stringify(proposal), confidence],
+    );
+    await client.query("select set_config('request.jwt.claim.sub', $1, true)", [STAFF_ID]);
+    await client.query("set local role authenticated");
+    return { txnId: txn.rows[0]!.id, decisionId: decision.rows[0]!.id };
+  }
+
+  const review = (decisionId: string, action: string, entry: object | null = null, bulk = false) =>
+    client.query<{ id: string }>("select public.record_human_review($1, $2, $3, $4, $5, $6) as id", [
+      decisionId,
+      action,
+      entry === null ? null : JSON.stringify(entry),
+      null,
+      7,
+      bulk,
+    ]);
+
+  async function inTx(fn: () => Promise<void>) {
+    await client.query("begin");
+    try {
+      await fn();
+    } finally {
+      await client.query("rollback");
+    }
+  }
+
+  it("承認すると本人名義で記録され、明細は承認済、過去仕訳に加わる", () =>
+    inTx(async () => {
+      const { txnId, decisionId } = await setup();
+      const res = await review(decisionId, "approve", null, true);
+      const row = await client.query("select action, reviewer_id, final_entry, bulk, review_seconds from public.human_reviews where id = $1", [res.rows[0]!.id]);
+      expect(row.rows[0]).toMatchObject({ action: "approve", reviewer_id: STAFF_ID, bulk: true, review_seconds: 7 });
+      expect(row.rows[0].final_entry).toMatchObject({ account_item_id: 105, tax_code: 21, section_id: 401 });
+      const txn = await client.query("select status from public.bank_transactions where id = $1", [txnId]);
+      expect(txn.rows[0]).toEqual({ status: "approved" });
+      const past = await client.query("select partner_key, account_item_id from public.past_journal_entries where ai_decision_id = $1", [decisionId]);
+      expect(past.rows).toEqual([{ partner_key: "サンプルフドウサン", account_item_id: "105" }]);
+    }));
+
+  it("修正は差分を残す", () =>
+    inTx(async () => {
+      const { decisionId } = await setup("medium");
+      const res = await review(decisionId, "correct", { ...PROPOSAL, account_item_id: 102 });
+      const row = await client.query("select action, diff from public.human_reviews where id = $1", [res.rows[0]!.id]);
+      expect(row.rows[0]).toEqual({ action: "correct", diff: { account_item_id: { before: 105, after: 102 } } });
+    }));
+
+  it("修正にマスタにない値は使えない", () =>
+    inTx(async () => {
+      const { decisionId } = await setup("low");
+      const message = await expectQueryError(client, "select public.record_human_review($1, 'correct', $2, null, 1, false)", [
+        decisionId,
+        JSON.stringify({ ...PROPOSAL, account_item_id: 999 }),
+      ]);
+      expect(message).toMatch(/マスタにありません/);
+    }));
+
+  it("まとめて承認は確信度「高」だけ", () =>
+    inTx(async () => {
+      const { decisionId } = await setup("medium");
+      const message = await expectQueryError(client, "select public.record_human_review($1, 'approve', null, null, 1, true)", [decisionId]);
+      expect(message).toMatch(/確信度「高」だけ/);
+    }));
+
+  it("提案がなければ承認できない（修正として入力する）", () =>
+    inTx(async () => {
+      const { decisionId } = await setup("low", null);
+      const message = await expectQueryError(client, "select public.record_human_review($1, 'approve', null, null, 1, false)", [decisionId]);
+      expect(message).toMatch(/提案がない/);
+    }));
+
+  it("確認済みの明細は二重に承認できない", () =>
+    inTx(async () => {
+      const { decisionId } = await setup();
+      await review(decisionId, "approve");
+      const message = await expectQueryError(client, "select public.record_human_review($1, 'approve', null, null, 1, false)", [decisionId]);
+      expect(message).toMatch(/確認済み/);
+    }));
+
+  it("保留した明細はあとで承認できる", () =>
+    inTx(async () => {
+      const { txnId, decisionId } = await setup();
+      await review(decisionId, "hold");
+      expect((await client.query("select status from public.bank_transactions where id = $1", [txnId])).rows[0]).toEqual({ status: "on_hold" });
+      await review(decisionId, "approve");
+      expect((await client.query("select status from public.bank_transactions where id = $1", [txnId])).rows[0]).toEqual({ status: "approved" });
+    }));
+
+  it("担当外の顧客の仕訳候補は確認できない", () =>
+    inTx(async () => {
+      const { decisionId } = await setup();
+      await client.query("reset role");
+      await client.query("select set_config('request.jwt.claim.sub', $1, true)", ["00000000-0000-4000-8000-000000000099"]);
+      await client.query("insert into auth.users (id) values ('00000000-0000-4000-8000-000000000099')");
+      await client.query(
+        "insert into public.staff_members (user_id, email, display_name, role) values ('00000000-0000-4000-8000-000000000099', 'x@example.com', '別担当', 'staff')",
+      );
+      await client.query("set local role authenticated");
+      const message = await expectQueryError(client, "select public.record_human_review($1, 'approve', null, null, 1, false)", [decisionId]);
+      expect(message).toMatch(/見つかりません/);
+    }));
 });
