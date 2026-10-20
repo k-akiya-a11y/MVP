@@ -23,7 +23,9 @@ create table public.wallets (
   freee_walletable_id bigint,
   created_at timestamptz not null default now(),
   unique (customer_id, name),
-  unique (customer_id, kind, freee_walletable_id)
+  unique (customer_id, kind, freee_walletable_id),
+  -- 明細・ルールから (wallet_id, customer_id) で参照し、別顧客の口座を指せないようにする
+  unique (id, customer_id)
 );
 
 create index wallets_customer_idx on public.wallets (customer_id);
@@ -55,7 +57,7 @@ create table public.journal_rule_versions (
   cond_amount_min bigint check (cond_amount_min is null or cond_amount_min >= 0),
   -- 上限は「未満」
   cond_amount_max bigint check (cond_amount_max is null or cond_amount_max > 0),
-  cond_wallet_id uuid references public.wallets (id),
+  cond_wallet_id uuid,
   cond_direction text check (cond_direction in ('income', 'expense')),
 
   -- 処理（freee マスタの ID）
@@ -72,6 +74,7 @@ create table public.journal_rule_versions (
   created_by uuid references public.staff_members (user_id),
   created_at timestamptz not null default now(),
   primary key (rule_id, version),
+  foreign key (cond_wallet_id, customer_id) references public.wallets (id, customer_id),
   -- 条件が1つもないルールは全取引に一致してしまうので禁止
   check (
     cond_partner_key is not null

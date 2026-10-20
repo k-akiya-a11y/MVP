@@ -8,7 +8,7 @@
 create table public.ai_decisions (
   id uuid primary key default gen_random_uuid(),
   customer_id uuid not null references public.customers (id) on delete restrict,
-  bank_transaction_id uuid not null references public.bank_transactions (id) on delete restrict,
+  bank_transaction_id uuid not null,
   -- 受け取った取引の内容（判定時点の写し。口座番号などは含めない）
   transaction_snapshot jsonb not null,
   -- 提案した処理（科目・税区分・取引先・品目・部門・メモタグ・摘要）。AI が判断できないときは null
@@ -34,7 +34,9 @@ create table public.ai_decisions (
   -- 費用は浮動小数点を避け、100万分の1ドル単位の整数で持つ
   cost_usd_micros bigint check (cost_usd_micros >= 0),
   created_at timestamptz not null default now(),
-  check (ai_output is null or (model is not null and prompt_version is not null))
+  check (ai_output is null or (model is not null and prompt_version is not null)),
+  foreign key (bank_transaction_id, customer_id)
+    references public.bank_transactions (id, customer_id) on delete restrict
 );
 
 create index ai_decisions_txn_idx on public.ai_decisions (bank_transaction_id, created_at desc);

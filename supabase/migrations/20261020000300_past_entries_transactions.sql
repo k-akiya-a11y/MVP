@@ -38,7 +38,7 @@ create index past_journal_entries_partner_key_idx
 create table public.statement_imports (
   id uuid primary key default gen_random_uuid(),
   customer_id uuid not null references public.customers (id) on delete cascade,
-  wallet_id uuid not null references public.wallets (id),
+  wallet_id uuid not null,
   source text not null check (source in ('csv', 'freee_wallet_txns')),
   file_name text,
   -- CSV の形式（銀行・カード会社ごとの列の並び）
@@ -46,7 +46,9 @@ create table public.statement_imports (
   imported_by uuid references public.staff_members (user_id),
   imported_at timestamptz not null default now(),
   row_count integer not null default 0 check (row_count >= 0),
-  skipped_duplicate_count integer not null default 0 check (skipped_duplicate_count >= 0)
+  skipped_duplicate_count integer not null default 0 check (skipped_duplicate_count >= 0),
+  foreign key (wallet_id, customer_id) references public.wallets (id, customer_id),
+  unique (id, customer_id)
 );
 
 create index statement_imports_customer_idx on public.statement_imports (customer_id);
@@ -55,8 +57,8 @@ create index statement_imports_customer_idx on public.statement_imports (custome
 create table public.bank_transactions (
   id uuid primary key default gen_random_uuid(),
   customer_id uuid not null references public.customers (id) on delete cascade,
-  wallet_id uuid not null references public.wallets (id),
-  import_id uuid not null references public.statement_imports (id),
+  wallet_id uuid not null,
+  import_id uuid not null,
   txn_date date not null,
   amount bigint not null check (amount > 0),
   direction text not null check (direction in ('income', 'expense')),
@@ -70,7 +72,10 @@ create table public.bank_transactions (
     check (status in ('new', 'proposed', 'approved', 'registered', 'on_hold', 'rejected')),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  unique (customer_id, dedupe_key)
+  unique (customer_id, dedupe_key),
+  unique (id, customer_id),
+  foreign key (wallet_id, customer_id) references public.wallets (id, customer_id),
+  foreign key (import_id, customer_id) references public.statement_imports (id, customer_id)
 );
 
 create unique index bank_transactions_freee_uniq
