@@ -125,20 +125,19 @@ MVPの機能（優先順位）:
 
 ## 9. 実行・テスト方法
 
-> アプリはまだ作成していません（このリポジトリは初期構成のみ）。Next.js の初期化後、ここに実際のコマンドを追記してください。
-
-予定しているコマンド（Next.js 初期化後に確定）:
-
 ```bash
-npm install          # 依存関係のインストール
+npm install                  # 依存関係のインストール（Node.js 22 以上）
 cp .env.example .env.local   # 環境変数を設定（値は各自で入力）
-npm run dev          # 開発サーバー
-npm run lint         # Lint
-npm run typecheck    # 型チェック
-npm test             # ユニットテスト
-npx supabase start   # ローカル Supabase（Docker が必要）
-npx supabase db reset  # マイグレーションと seed を適用
+npm run dev                  # 開発サーバー
+npm run lint                 # Lint
+npm run typecheck            # 型チェック
+npm test                     # ユニットテスト（外部 API はモック）
+npm run db:test:local        # マイグレーション・RLS のテスト（Docker 不要。ローカルの Postgres 16 を一時起動）
+npx supabase start           # ローカル Supabase（Docker が必要）
+npx supabase db reset        # マイグレーションと seed（supabase/seed/*.sql）を適用
 ```
+
+- DB テストは `TEST_DATABASE_URL` の Postgres に `npm run db:apply`（Supabase 互換の土台 `tests/db/supabase-shim.sql` → マイグレーション → seed）を適用してから `npm run test:db` で流します。CI（`.github/workflows/ci.yml`）も同じ手順です。
 
 変更を出す前に、lint・型チェック・テストがすべて通ることを確認してください。
 
