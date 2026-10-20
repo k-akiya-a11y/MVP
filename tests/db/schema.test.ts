@@ -290,7 +290,8 @@ describe("明細の取込", () => {
       expect(second.rows[0]).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 2 });
 
       const imports = await client.query(
-        "select row_count, skipped_duplicate_count, imported_by from public.statement_imports order by imported_at, file_name",
+        // 同じトランザクション内なので imported_at は同じ。照合順序に依存しないよう件数で並べる
+        "select row_count, skipped_duplicate_count, imported_by from public.statement_imports order by skipped_duplicate_count",
       );
       expect(imports.rows).toEqual([
         { row_count: 2, skipped_duplicate_count: 0, imported_by: STAFF_ID },
