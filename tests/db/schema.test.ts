@@ -5,6 +5,7 @@ import {
   CUSTOMER_A,
   CUSTOMER_B,
   STAFF_ID,
+  WALLET_A,
   asActor,
   connect,
   expectQueryError,
@@ -271,6 +272,62 @@ describe("顧客ルールは版で管理する", () => {
         [CUSTOMER_A],
       );
       expect(message).toMatch(/check constraint/);
+    } finally {
+      await client.query("rollback");
+    }
+  });
+});
+
+describe("明細の取込", () => {
+  const rows = [
+    { txn_date: "2026-10-27", amount: 9020, direction: "expense", description: "ｻﾝﾌﾟﾙﾂｳｼﾝ(ｶ", balance: 100000, dedupe_key: "k1" },
+    { txn_date: "2026-10-31", amount: 330000, direction: "income", description: "ﾃｽﾄｺｷﾔｸ(ｶ", balance: 430000, dedupe_key: "k2" },
+  ];
+
+  it("担当者が取り込むと件数が返り、同じ取引の再取込は読み飛ばす", async () => {
+    await asActor(client, { role: "authenticated", userId: STAFF_ID }, async () => {
+      const first = await client.query(
+        "select * from public.import_bank_statement($1, $2, 'csv', 'oct.csv', 'bank_generic', $3)",
+        [CUSTOMER_A, WALLET_A, JSON.stringify(rows)],
+      );
+      expect(first.rows[0]).toMatchObject({ inserted_count: 2, skipped_duplicate_count: 0 });
+
+      const second = await client.query(
+        "select * from public.import_bank_statement($1, $2, 'csv', 'oct2.csv', 'bank_generic', $3)",
+        [CUSTOMER_A, WALLET_A, JSON.stringify(rows)],
+      );
+      expect(second.rows[0]).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 2 });
+
+      const imports = await client.query(
+        "select row_count, skipped_duplicate_count, imported_by from public.statement_imports order by imported_at, file_name",
+      );
+      expect(imports.rows).toEqual([
+        { row_count: 2, skipped_duplicate_count: 0, imported_by: STAFF_ID },
+        { row_count: 2, skipped_duplicate_count: 2, imported_by: STAFF_ID },
+      ]);
+    });
+  });
+
+  it("担当外の顧客には取り込めない", async () => {
+    await asActor(client, { role: "authenticated", userId: STAFF_ID }, async () => {
+      const message = await expectQueryError(
+        client,
+        "select * from public.import_bank_statement($1, $2, 'csv', 'x.csv', 'bank_generic', $3)",
+        [CUSTOMER_B, WALLET_A, JSON.stringify(rows)],
+      );
+      expect(message).toMatch(/row-level security/);
+    });
+  });
+
+  it("別の顧客の口座は指定できない", async () => {
+    await client.query("begin");
+    try {
+      const message = await expectQueryError(
+        client,
+        `insert into public.statement_imports (customer_id, wallet_id, source) values ($1, $2, 'csv')`,
+        [CUSTOMER_B, WALLET_A],
+      );
+      expect(message).toMatch(/foreign key/);
     } finally {
       await client.query("rollback");
     }
