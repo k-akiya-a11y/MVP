@@ -1,0 +1,10 @@
+# Supabase CLI のローカル設定（npx supabase start / db reset 用）。
+# ここに無い項目は CLI の既定値を使う。
+project_id = "yuinoyashiro-ai-keiri-mvp"
+
+[db]
+major_version = 16
+
+[db.seed]
+enabled = true
+sql_paths = ["./seed/*.sql"]
