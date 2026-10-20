@@ -17,6 +17,7 @@
     "db:test:local": "scripts/test-db-local.sh"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.135.0",
     "@supabase/ssr": "^0.12.7",
     "@supabase/supabase-js": "^2.118.0",
     "next": "^15.5.28",

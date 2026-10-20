@@ -333,3 +333,54 @@ describe("明細の取込", () => {
     }
   });
 });
+
+describe("AI判断の記録", () => {
+  async function newTxn(): Promise<string> {
+    const imp = await client.query<{ id: string }>(
+      `insert into public.statement_imports (customer_id, wallet_id, source) values ($1, $2, 'csv') returning id`,
+      [CUSTOMER_A, WALLET_A],
+    );
+    const txn = await client.query<{ id: string }>(
+      `insert into public.bank_transactions (customer_id, wallet_id, import_id, txn_date, amount, direction, description, dedupe_key)
+       values ($1, $2, $3, '2026-10-27', 9020, 'expense', 'ｻﾝﾌﾟﾙﾂｳｼﾝ(ｶ', 'rec-1') returning id`,
+      [CUSTOMER_A, WALLET_A, imp.rows[0]!.id],
+    );
+    return txn.rows[0]!.id;
+  }
+
+  it("判断を記録すると明細が候補作成済になる", async () => {
+    await client.query("begin");
+    try {
+      const txnId = await newTxn();
+      await client.query("set local role service_role");
+      const decision = {
+        customer_id: CUSTOMER_A,
+        bank_transaction_id: txnId,
+        transaction_snapshot: { amount: 9020 },
+        proposal: { account_item_id: 101, tax_code: 21 },
+        confidence: "high",
+        confidence_breakdown: { rule: { matched: true } },
+        rule_versions_used: [{ rule_id: "30000000-0000-4000-8000-000000000001", version: 1 }],
+        past_entry_ids: [],
+        ai_unknowns: [],
+        model: null,
+        prompt_version: null,
+      };
+      const res = await client.query<{ id: string }>("select public.record_ai_decision($1) as id", [JSON.stringify(decision)]);
+      expect(res.rows[0]!.id).toMatch(/^[0-9a-f-]{36}$/);
+      const txn = await client.query("select status from public.bank_transactions where id = $1", [txnId]);
+      expect(txn.rows[0]).toEqual({ status: "proposed" });
+      const row = await client.query("select confidence, rule_versions_used from public.ai_decisions where id = $1", [res.rows[0]!.id]);
+      expect(row.rows[0]).toMatchObject({ confidence: "high" });
+    } finally {
+      await client.query("rollback");
+    }
+  });
+
+  it("担当者は AI判断の記録を呼べない", async () => {
+    await asActor(client, { role: "authenticated", userId: STAFF_ID }, async () => {
+      const message = await expectQueryError(client, "select public.record_ai_decision('{}'::jsonb)");
+      expect(message).toMatch(/permission denied/);
+    });
+  });
+});
