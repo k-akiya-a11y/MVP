@@ -53,6 +53,8 @@ export type ReviewItem = {
   unknowns: string[];
   aiUsed: boolean;
   pastExamples: { id: string; date: string; amount: number; bankDescription: string | null; entry: EntryJson }[];
+  /** この仕訳候補の保留の記録（古い順）。保留した人の理由を承認者が読んで判断する */
+  holds: { reason: string | null; reviewerName: string; at: string }[];
 };
 
 export type MasterOption = { id: number; name: string };
@@ -210,6 +212,43 @@ export async function loadReviewQueue(client: SupabaseClient, customerId: string
   ).flat();
   const pastById = new Map(pastRows.map((p) => [p.id, p]));
 
+  const holdRows = (
+    await inChunks(decisions.map((d) => d.id), async (ids) =>
+      z
+        .array(z.object({ ai_decision_id: z.string(), reason: z.string().nullable(), reviewer_id: z.string(), created_at: z.string() }))
+        .parse(
+          ok(
+            await client
+              .from("human_reviews")
+              .select("ai_decision_id, reason, reviewer_id, created_at")
+              .eq("action", "hold")
+              .in("ai_decision_id", ids)
+              .order("created_at"),
+            "保留の記録",
+          ),
+        ),
+    )
+  ).flat();
+  // 担当者は自分以外の名前を読めない（RLS）ので、読めない人は「担当者」と表示する
+  const reviewerIds = [...new Set(holdRows.map((h) => h.reviewer_id))];
+  const reviewerNames = new Map(
+    (
+      await inChunks(reviewerIds, async (ids) =>
+        z
+          .array(z.object({ user_id: z.string(), display_name: z.string() }))
+          .parse(ok(await client.from("staff_members").select("user_id, display_name").in("user_id", ids), "担当者")),
+      )
+    )
+      .flat()
+      .map((s) => [s.user_id, s.display_name] as const),
+  );
+  const holdsByDecision = new Map<string, ReviewItem["holds"]>();
+  for (const h of holdRows) {
+    const list = holdsByDecision.get(h.ai_decision_id) ?? [];
+    list.push({ reason: h.reason, reviewerName: reviewerNames.get(h.reviewer_id) ?? "担当者", at: h.created_at });
+    holdsByDecision.set(h.ai_decision_id, list);
+  }
+
   const items: ReviewItem[] = [];
   for (const t of txns) {
     const d = decisionByTxn.get(t.id);
@@ -237,6 +276,7 @@ export async function loadReviewQueue(client: SupabaseClient, customerId: string
       aiReason: d.ai_reason,
       unknowns: d.ai_unknowns,
       aiUsed: d.model !== null,
+      holds: holdsByDecision.get(d.id) ?? [],
       pastExamples: d.past_entry_ids.flatMap((id) => {
         const p = pastById.get(id);
         return p

@@ -4,6 +4,7 @@
 --
 -- 承認者（設計書10章 決めること3）: 確定につながる操作（承認・修正・却下）は管理者だけが行える。
 -- 担当者ができるのは保留（理由を添えて管理者に回す）だけ。
+-- 保留は引継ぎなので理由を必須にする（空白だけの理由も拒否する）。
 
 -- 担当者が human_reviews に直接書くことは止め、この関数だけを通す
 revoke insert on public.human_reviews from authenticated;
@@ -90,6 +91,8 @@ declare
   v_key text;
   v_review_id uuid;
   v_user uuid := auth.uid();
+  -- 前後の空白（全角空白・改行を含む）を除いた理由
+  v_reason text := nullif(regexp_replace(coalesce(p_reason, ''), '^[[:space:]　]+|[[:space:]　]+$', '', 'g'), '');
 begin
   if v_user is null or not exists (select 1 from public.staff_members where user_id = v_user) then
     raise exception 'ログインした担当者だけが確認を記録できます' using errcode = 'insufficient_privilege';
@@ -100,6 +103,9 @@ begin
     raise exception '仕訳候補が見つかりません' using errcode = 'no_data_found';
   end if;
 
+  if p_action = 'hold' and v_reason is null then
+    raise exception '保留の理由を入力してください';
+  end if;
   if p_action in ('approve', 'correct', 'reject') and not public.is_admin() then
     raise exception '承認・修正・却下は承認者（管理者）だけが行えます。保留にして理由を残してください'
       using errcode = 'insufficient_privilege';
@@ -149,7 +155,7 @@ begin
   insert into public.human_reviews
     (customer_id, ai_decision_id, action, final_entry, diff, reason, reviewer_id, review_seconds, bulk)
   values
-    (d.customer_id, d.id, p_action, v_final, v_diff, nullif(p_reason, ''), v_user, p_review_seconds, p_bulk)
+    (d.customer_id, d.id, p_action, v_final, v_diff, v_reason, v_user, p_review_seconds, p_bulk)
   returning id into v_review_id;
 
   update public.bank_transactions

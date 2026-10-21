@@ -1,6 +1,9 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 
+/** 前後の空白（全角空白・改行を含む）を除く。DB の record_human_review と同じ扱い */
+export const trimReason = (reason: string | null) => (reason ?? "").replace(/^[\s\u3000]+|[\s\u3000]+$/g, "");
+
 export const reviewInputSchema = z
   .object({
     decisionId: z.string().uuid(),
@@ -22,6 +25,9 @@ export const reviewInputSchema = z
   })
   .refine((v) => (v.action === "correct") === (v.finalEntry !== null), {
     message: "修正のときだけ確定内容を指定します",
+  })
+  .refine((v) => v.action !== "hold" || trimReason(v.reason) !== "", {
+    message: "保留の理由を入力してください",
   });
 
 export type ReviewInput = z.infer<typeof reviewInputSchema>;

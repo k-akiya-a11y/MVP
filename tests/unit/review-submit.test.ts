@@ -52,10 +52,17 @@ describe("submitReview", () => {
       decisionId: DECISION,
       action: "hold",
       finalEntry: null,
-      reason: null,
+      reason: "顧客に確認中",
       reviewSeconds: 1,
       bulk: false,
     });
     expect(result).toEqual({ ok: false, error: "この明細はすでに確認済みです（approved）" });
+  });
+
+  it.each([null, "", "  ", "　\n"])("保留の理由が空（%j）なら DB を呼ばずに拒否する", async (reason) => {
+    const { client, rpc } = fakeClient({ data: "rev-1", error: null });
+    const result = await submitReview(client, { decisionId: DECISION, action: "hold", finalEntry: null, reason, reviewSeconds: 1, bulk: false });
+    expect(result).toEqual({ ok: false, error: "保留の理由を入力してください" });
+    expect(rpc).not.toHaveBeenCalled();
   });
 });

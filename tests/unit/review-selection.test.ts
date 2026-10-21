@@ -18,6 +18,7 @@ function item(decisionId: string, confidence: ReviewItem["confidence"], status: 
     unknowns: [],
     aiUsed: false,
     pastExamples: [],
+    holds: [],
   };
 }
 

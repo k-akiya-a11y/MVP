@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EntryJson, MasterOption, ReviewItem, ReviewQueue } from "@/lib/review/queue";
 import { bulkApprovalTargets } from "@/lib/review/selection";
+import { trimReason } from "@/lib/review/submit";
 import { bulkApproveAction, reviewAction } from "./actions";
 
 type Tab = "high" | "medium" | "low" | "on_hold";
@@ -95,6 +96,11 @@ export function ReviewBoard({
     async (action: "approve" | "correct" | "hold" | "reject", entry: EntryJson | null = null) => {
       if (!current || busy) return;
       if (action !== "hold" && !canApprove) return;
+      // 保留は引継ぎなので理由を必須にする（DB でも拒否する）
+      if (action === "hold" && trimReason(reason) === "") {
+        setMessage("保留の理由を入力してください");
+        return;
+      }
       setBusy(true);
       setMessage(null);
       // 確認した明細は、結果にかかわらずまとめて承認の選択から外す（保留した明細が混ざらないように）
@@ -284,7 +290,7 @@ export function ReviewBoard({
                   <p>提案はありません。内容を確認して入力してください（e）。</p>
                 )}
                 <label>
-                  理由・メモ（保留・却下のとき）
+                  理由（保留のときは必須。却下のときは任意）
                   <input value={reason} onChange={(e) => setReason(e.target.value)} maxLength={1000} />
                 </label>
                 <div className="actions">
@@ -299,7 +305,7 @@ export function ReviewBoard({
                     </>
                   )}
                   {tab !== "on_hold" && (
-                    <button type="button" disabled={busy} onClick={() => void act("hold")}>
+                    <button type="button" disabled={busy || trimReason(reason) === ""} onClick={() => void act("hold")}>
                       保留 (h)
                     </button>
                   )}
@@ -309,6 +315,19 @@ export function ReviewBoard({
                     </button>
                   )}
                 </div>
+              </>
+            )}
+
+            {current.holds.length > 0 && (
+              <>
+                <h3>保留の理由</h3>
+                <ul>
+                  {current.holds.map((h) => (
+                    <li key={h.at}>
+                      {new Date(h.at).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" })} {h.reviewerName}: {h.reason ?? "（理由なし）"}
+                    </li>
+                  ))}
+                </ul>
               </>
             )}
 
