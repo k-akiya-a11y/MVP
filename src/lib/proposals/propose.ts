@@ -1,7 +1,7 @@
 import { buildJournalPrompt } from "../ai/prompt";
 import type { AiCallResult, JournalAi } from "../ai/client";
 import type { AiJournalOutput } from "../ai/schema";
-import { validateAgainstMasters } from "../ai/validate";
+import { findMasterProblems, validateAgainstMasters } from "../ai/validate";
 import { computeConfidence, type ConfidenceInput, type ConfidenceResult } from "../confidence/compute";
 import { searchPastEntries } from "../retrieval/search";
 import { matchRule, renderDescriptionTemplate } from "../rules/match";
@@ -63,6 +63,7 @@ export async function proposeForTransaction(
   const knownCombos = new Set(ctx.pastEntries.map((p) => `${p.entry.accountItemId}:${p.entry.taxCode}`));
 
   let proposal: JournalEntryFields | null = null;
+  let ruleProblems: string[] = [];
   let aiState: ConfidenceInput["ai"] = { called: false };
   let aiLog: DecisionDraft["ai"] = {
     output: null,
@@ -75,10 +76,15 @@ export async function proposeForTransaction(
 
   if (rule) {
     const { descriptionTemplate, ...entry } = rule.action;
-    proposal = {
-      ...entry,
-      description: descriptionTemplate ? renderDescriptionTemplate(descriptionTemplate, txn) : txn.description,
-    };
+    // ルールもマスタと照らす。マスタにない値（削除された部門など）を含むルールは提案に使わず、
+    // 確信度「低」で人の確認に回す（承認時にも DB で弾くが、候補の段階で止める）
+    ruleProblems = findMasterProblems(entry, ctx.masters);
+    if (ruleProblems.length === 0) {
+      proposal = {
+        ...entry,
+        description: descriptionTemplate ? renderDescriptionTemplate(descriptionTemplate, txn) : txn.description,
+      };
+    }
   } else {
     const result = await ai(
       buildJournalPrompt({ customer: ctx.customer, masters: ctx.masters, notes: ctx.notes, txn, walletName, past }),
@@ -111,6 +117,7 @@ export async function proposeForTransaction(
     customer: ctx.customer,
     masters: ctx.masters,
     rule,
+    ruleProblems,
     past,
     knownCombos,
     proposal,

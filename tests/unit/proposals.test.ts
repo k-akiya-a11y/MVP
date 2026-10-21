@@ -63,6 +63,22 @@ describe("proposeForTransaction", () => {
     expect(draft.ai.model).toBeNull();
   });
 
+  it("マスタにない値（存在しない部門）を含むルールは提案に使わず、確信度は低", async () => {
+    const ctx = sampleContext();
+    ctx.activeRules = ctx.activeRules.map((r) => ({ ...r, action: { ...r.action, sectionId: 999 } }));
+    const ai = mockAi();
+    const draft = await proposeForTransaction(ctx, txn({ description: "ｻﾝﾌﾟﾙﾂｳｼﾝ(ｶ", amount: 9020, txnDate: "2026-10-27" }), ai);
+    expect(ai).not.toHaveBeenCalled();
+    expect(draft.proposal).toBeNull();
+    expect(draft.confidence.level).toBe("low");
+    expect(draft.confidence.breakdown.checks).toContainEqual(
+      expect.objectContaining({ id: "rule_masters", passed: false, detail: expect.stringContaining("部門 999 はマスタにありません") }),
+    );
+    expect(draft.confidence.breakdown.reasons[0]).toMatch(/ルールの見直しが必要/);
+    // どのルールの版で止まったかは判断ログに残る
+    expect(draft.ruleVersionsUsed).toEqual([{ ruleId: "30000000-0000-4000-8000-000000000001", version: 1 }]);
+  });
+
   it("過去5件以上・一致率95%以上で AI も一致すれば高", async () => {
     const ai = mockAi();
     const draft = await proposeForTransaction(sampleContext(), txn(), ai);

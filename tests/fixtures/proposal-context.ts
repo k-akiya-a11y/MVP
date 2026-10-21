@@ -35,6 +35,7 @@ export function sampleContext(): CustomerContext {
       { kind: "tax", id: 2, name: "対象外" },
       { kind: "tax", id: 21, name: "課対仕入10%" },
       { kind: "tax", id: 31, name: "課税売上10%" },
+      { kind: "partner", id: 301, name: "サンプル通信株式会社" },
       { kind: "partner", id: 302, name: "サンプル不動産株式会社" },
       { kind: "section", id: 401, name: "本社" },
     ],

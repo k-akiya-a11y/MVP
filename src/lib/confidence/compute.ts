@@ -18,6 +18,8 @@ export type ConfidenceInput = {
   customer: Customer;
   masters: readonly MasterEntry[];
   rule: RuleVersion | null;
+  /** 一致したルールの処理のうち、マスタにない値（空なら問題なし） */
+  ruleProblems?: readonly string[];
   past: PastSearchResult;
   /** その顧客の過去仕訳で使われた「科目:税区分」の組合せ（科目と税区分の整合の検査用） */
   knownCombos: ReadonlySet<string>;
@@ -63,6 +65,7 @@ const sameCombo = (e: JournalEntryFields, c: { accountItemId: number; taxCode: n
  */
 export function computeConfidence(input: ConfidenceInput): ConfidenceResult {
   const { txn, customer, masters, rule, past, proposal, ai } = input;
+  const ruleProblems = input.ruleProblems ?? [];
   const reasons: string[] = [];
   const forcedLow: string[] = [];
 
@@ -80,6 +83,13 @@ export function computeConfidence(input: ConfidenceInput): ConfidenceResult {
 
   // --- 検査 ---
   const checks: ConfidenceCheck[] = [];
+  if (rule) {
+    checks.push({
+      id: "rule_masters",
+      passed: ruleProblems.length === 0,
+      detail: ruleProblems.length ? `ルールの処理にマスタにない値: ${ruleProblems.join("、")}` : "ルールの処理はマスタにある値だけ",
+    });
+  }
   const text = normalizeText(txn.description);
   const caution = CAUTION_WORDS.filter((w) => text.includes(w));
   checks.push({
@@ -123,6 +133,10 @@ export function computeConfidence(input: ConfidenceInput): ConfidenceResult {
   // --- 判定 ---
   if (forcedLow.length > 0) {
     reasons.push(...forcedLow);
+    return { level: "low", breakdown };
+  }
+  if (rule && ruleProblems.length > 0) {
+    reasons.push(`ルールの処理にマスタにない値がある（ルールの見直しが必要）: ${ruleProblems.join("、")}`);
     return { level: "low", breakdown };
   }
   if (!proposal) {
