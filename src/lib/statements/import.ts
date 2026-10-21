@@ -1,5 +1,11 @@
 import { findStatementFormat } from "./formats";
-import { buildDedupeKeys, decodeStatement, parseStatementCsv, type StatementParseError } from "./parse";
+import {
+  buildDedupeKeys,
+  decodeStatement,
+  parseStatementCsv,
+  type StatementIgnoredRow,
+  type StatementParseError,
+} from "./parse";
 
 export type StatementImportRow = {
   txn_date: string;
@@ -10,59 +16,74 @@ export type StatementImportRow = {
   dedupe_key: string;
 };
 
-/** DB への登録（import_bank_statement）。テストではモックに差し替える */
-export type StatementImportGateway = (args: {
-  customerId: string;
-  walletId: string;
-  fileName: string;
-  formatId: string;
-  rows: StatementImportRow[];
-}) => Promise<ImportCounts>;
+type ImportTarget = { customerId: string; walletId: string; fileName: string; formatId: string };
 
 /**
- * 取込の件数。skipped は残高まで一致した取込済みの行（読み飛ばし）、
+ * 取込の件数と金額（円）。skipped は残高まで一致した取込済みの行（読み飛ばし）、
  * suspected は取込済みの行と区別できず「重複の疑い」として確認に回した行。
+ * 読めた行 = inserted + skipped + suspected が件数・金額の両方で成り立つ（DB の制約でも確かめる）。
  */
 export type ImportCounts = {
   importId: string;
   insertedCount: number;
   skippedDuplicateCount: number;
   suspectedDuplicateCount: number;
+  ignoredCount: number;
+  incomeTotal: number;
+  expenseTotal: number;
+  insertedAmountTotal: number;
+  skippedAmountTotal: number;
+  suspectedAmountTotal: number;
+};
+
+/** DB への登録（import_bank_statement・record_failed_statement_import）。テストではモックに差し替える */
+export type StatementImportGateway = {
+  importRows(
+    args: ImportTarget & { rows: StatementImportRow[]; sourceRowCount: number; ignored: StatementIgnoredRow[] },
+  ): Promise<Omit<ImportCounts, "ignoredCount">>;
+  /** 取り込まなかったファイルも、理由と行番号を取込記録に残す */
+  recordFailure(args: ImportTarget & { sourceRowCount: number | null; errors: StatementParseError[] }): Promise<string>;
 };
 
 export type ImportStatementResult =
   | ({ ok: true } & ImportCounts)
-  | { ok: false; errors: StatementParseError[] };
+  | { ok: false; errors: StatementParseError[]; failureRecordId: string | null };
 
 /**
- * 明細 CSV を取り込む。1行でも読めない行があればファイル全体を取り込まない
+ * 明細 CSV を取り込む。1行でも読めない行があればファイル全体を取り込まず、失敗として記録する
  * （一部だけ取り込むと、取込漏れの明細に気づけなくなるため）。
  */
 export async function importStatementCsv(
-  input: { customerId: string; walletId: string; fileName: string; formatId: string; bytes: Uint8Array },
+  input: ImportTarget & { bytes: Uint8Array },
   gateway: StatementImportGateway,
 ): Promise<ImportStatementResult> {
-  const format = findStatementFormat(input.formatId);
+  const { bytes, ...target } = input;
+  const fail = async (errors: StatementParseError[], sourceRowCount: number | null): Promise<ImportStatementResult> => {
+    // 未対応の形式は取込記録の csv_format に入れられないので、記録せずに返す
+    const failureRecordId = findStatementFormat(target.formatId)
+      ? await gateway.recordFailure({ ...target, sourceRowCount, errors })
+      : null;
+    return { ok: false, errors, failureRecordId };
+  };
+
+  const format = findStatementFormat(target.formatId);
   if (!format) {
-    return { ok: false, errors: [{ line: 0, message: `未対応の CSV 形式です: ${input.formatId}` }] };
+    return fail([{ line: 0, message: `未対応の CSV 形式です: ${target.formatId}` }], null);
   }
   let text: string;
   try {
-    text = decodeStatement(input.bytes, format.encoding);
+    text = decodeStatement(bytes, format.encoding);
   } catch {
-    return {
-      ok: false,
-      errors: [{ line: 0, message: `文字コードを読めません（${format.encoding} を想定）` }],
-    };
+    return fail([{ line: 0, message: `文字コードを読めません（${format.encoding} を想定）` }], null);
   }
   const parsed = parseStatementCsv(text, format);
   if (parsed.errors.length > 0) {
-    return { ok: false, errors: parsed.errors };
+    return fail(parsed.errors, parsed.sourceRowCount);
   }
   if (parsed.rows.length === 0) {
-    return { ok: false, errors: [{ line: 0, message: "取引の行がありません" }] };
+    return fail([{ line: 0, message: "取引の行がありません" }], parsed.sourceRowCount);
   }
-  const keys = buildDedupeKeys(input.walletId, parsed.rows);
+  const keys = buildDedupeKeys(target.walletId, parsed.rows);
   const rows: StatementImportRow[] = parsed.rows.map((row, i) => ({
     txn_date: row.txnDate,
     amount: row.amount,
@@ -71,12 +92,12 @@ export async function importStatementCsv(
     balance: row.balance,
     dedupe_key: keys[i]!,
   }));
-  const result = await gateway({
-    customerId: input.customerId,
-    walletId: input.walletId,
-    fileName: input.fileName,
+  const result = await gateway.importRows({
+    ...target,
     formatId: format.id,
     rows,
+    sourceRowCount: parsed.sourceRowCount,
+    ignored: parsed.ignored,
   });
-  return { ok: true, ...result };
+  return { ok: true, ...result, ignoredCount: parsed.ignored.length };
 }

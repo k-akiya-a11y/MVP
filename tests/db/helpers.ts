@@ -51,8 +51,8 @@ export async function expectQueryError(client: Client, sql: string, params: unkn
 /** サンプルの明細・AI判断を1件作り、その ID を返す（呼出し側のトランザクション内） */
 export async function insertSampleDecision(client: Client): Promise<{ txnId: string; decisionId: string }> {
   const imp = await client.query<{ id: string }>(
-    `insert into public.statement_imports (customer_id, wallet_id, source, row_count)
-     values ($1, $2, 'csv', 1) returning id`,
+    `insert into public.statement_imports (customer_id, wallet_id, source, row_count, inserted_count)
+     values ($1, $2, 'csv', 1, 1) returning id`,
     [CUSTOMER_A, WALLET_A],
   );
   const txn = await client.query<{ id: string }>(

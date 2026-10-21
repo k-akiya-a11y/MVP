@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { parseCsv } from "./csv";
+import { parseCsvWithLines } from "./csv";
 import type { StatementCsvFormat } from "./formats";
 import { parseStatementDate, parseYen } from "./values";
 
@@ -17,9 +17,15 @@ export type ParsedStatementRow = {
 
 export type StatementParseError = { line: number; message: string };
 
+/** 取引として扱わなかった行（金額0の残高照会など）。捨てずに行番号と理由を取込記録に残す */
+export type StatementIgnoredRow = { line: number; reason: string };
+
 export type StatementParseResult = {
   rows: ParsedStatementRow[];
   errors: StatementParseError[];
+  ignored: StatementIgnoredRow[];
+  /** 見出し行より後の行数（空行を除く）。= rows + ignored + errors（照合に使う） */
+  sourceRowCount: number;
 };
 
 export function decodeStatement(bytes: Uint8Array, encoding: StatementCsvFormat["encoding"]): string {
@@ -64,29 +70,38 @@ function locateHeader(table: string[][], format: StatementCsvFormat) {
 
 /**
  * 明細 CSV を読み、取引の行に変換する。読めない行は errors に入れ、取込全体は止めない。
- * 金額0の行（残高照会の行など）は読み飛ばす。
+ * 金額0の行（残高照会の行など）は取引にせず、ignored に行番号と理由を残す。
  */
 export function parseStatementCsv(text: string, format: StatementCsvFormat): StatementParseResult {
-  const table = parseCsv(text);
+  const csvRows = parseCsvWithLines(text);
+  const table = csvRows.map((r) => r.cells);
   const header = locateHeader(table, format);
   if (!header) {
     return {
       rows: [],
       errors: [{ line: 1, message: `見出し行が見つかりません（形式: ${format.label}）` }],
+      ignored: [],
+      sourceRowCount: countDataRows(table, 0),
     };
   }
   const hasSplitColumns = header.withdrawal >= 0 || header.deposit >= 0;
   if (!hasSplitColumns && header.signedAmount < 0) {
-    return { rows: [], errors: [{ line: header.headerIndex + 1, message: "金額の列が見つかりません" }] };
+    return {
+      rows: [],
+      errors: [{ line: csvRows[header.headerIndex]!.line, message: "金額の列が見つかりません" }],
+      ignored: [],
+      sourceRowCount: countDataRows(table, header.headerIndex + 1),
+    };
   }
 
   const rows: ParsedStatementRow[] = [];
   const errors: StatementParseError[] = [];
+  const ignored: StatementIgnoredRow[] = [];
   const cell = (r: string[], idx: number) => (idx >= 0 ? (r[idx] ?? "") : "");
 
   for (let i = header.headerIndex + 1; i < table.length; i++) {
     const r = table[i]!;
-    const line = i + 1;
+    const line = csvRows[i]!.line;
     try {
       const txnDate = parseStatementDate(cell(r, header.date));
       const description = cell(r, header.description).trim();
@@ -101,7 +116,10 @@ export function parseStatementCsv(text: string, format: StatementCsvFormat): Sta
       } else {
         signed = parseYen(cell(r, header.signedAmount)) ?? 0;
       }
-      if (signed === 0) continue;
+      if (signed === 0) {
+        ignored.push({ line, reason: "金額が0（残高照会などの行）" });
+        continue;
+      }
       if (description === "") {
         throw new Error("摘要が空欄です");
       }
@@ -117,7 +135,12 @@ export function parseStatementCsv(text: string, format: StatementCsvFormat): Sta
       errors.push({ line, message: error instanceof Error ? error.message : String(error) });
     }
   }
-  return { rows, errors };
+  return { rows, errors, ignored, sourceRowCount: rows.length + errors.length + ignored.length };
+}
+
+/** 見出し行より後の、空でない行の数 */
+function countDataRows(table: string[][], from: number): number {
+  return table.slice(from).filter((r) => r.some((c) => c.trim() !== "")).length;
 }
 
 /**

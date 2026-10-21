@@ -3,7 +3,17 @@
  * 銀行・カード会社の CSV は CRLF が多いので CR も改行として扱う。
  */
 export function parseCsv(text: string): string[][] {
-  const rows: string[][] = [];
+  return parseCsvWithLines(text).map((r) => r.cells);
+}
+
+/** CSV の1行と、ファイル上の行番号（1始まり。クオート内の改行で複数行にまたがるときは開始行） */
+export type CsvRow = { cells: string[]; line: number };
+
+/** parseCsv と同じだが、空行を除いた後もファイル上の行番号を保つ（エラーの行番号を CSV と一致させるため） */
+export function parseCsvWithLines(text: string): CsvRow[] {
+  const rows: CsvRow[] = [];
+  let physicalLine = 1;
+  let rowStart = 1;
   let row: string[] = [];
   let field = "";
   let inQuotes = false;
@@ -20,6 +30,7 @@ export function parseCsv(text: string): string[][] {
           inQuotes = false;
         }
       } else {
+        if (ch === "\n" || (ch === "\r" && src[i + 1] !== "\n")) physicalLine++;
         field += ch;
       }
       continue;
@@ -32,17 +43,19 @@ export function parseCsv(text: string): string[][] {
     } else if (ch === "\r" || ch === "\n") {
       if (ch === "\r" && src[i + 1] === "\n") i++;
       row.push(field);
-      rows.push(row);
+      rows.push({ cells: row, line: rowStart });
       row = [];
       field = "";
+      physicalLine++;
+      rowStart = physicalLine;
     } else {
       field += ch;
     }
   }
   if (field !== "" || row.length > 0) {
     row.push(field);
-    rows.push(row);
+    rows.push({ cells: row, line: rowStart });
   }
   // 空行は捨てる
-  return rows.filter((r) => r.some((c) => c.trim() !== ""));
+  return rows.filter((r) => r.cells.some((c) => c.trim() !== ""));
 }
