@@ -9,16 +9,16 @@
  * - 実行前後で、担当顧客の明細の状態と確認ログの件数を比べ、変わっていないことも確かめる。
  */
 (async () => {
-  // ---- 実行前に書き換える値（どちらも公開されている値。秘密ではない） ----
-  const SUPABASE_URL = "https://<Reference ID>.supabase.co";
-  const ANON_KEY = "<NEXT_PUBLIC_SUPABASE_ANON_KEY の値>";
+  // ---- 接続先（どちらも公開されている値。秘密ではない）。ファイルは書き換えずに貼り、実行時に入力する ----
+  const SUPABASE_URL = (window.prompt("Supabase の Project URL（https://<Reference ID>.supabase.co）") || "").trim().replace(/\/+$/, "");
+  const ANON_KEY = (window.prompt("NEXT_PUBLIC_SUPABASE_ANON_KEY の値") || "").trim();
   // ---- seed の架空データの ID ----
   const CUSTOMER_A = "10000000-0000-4000-8000-000000000001"; // 担当: サンプル商事株式会社
   const CUSTOMER_B = "10000000-0000-4000-8000-000000000002"; // 担当外: テスト工房合同会社
   const WALLET_A = "20000000-0000-4000-8000-000000000001";
 
-  if (SUPABASE_URL.includes("<") || ANON_KEY.includes("<")) {
-    console.error("SUPABASE_URL と ANON_KEY を書き換えてから実行してください");
+  if (!/^https:\/\/[a-z0-9]+\.supabase\.co$/.test(SUPABASE_URL) || !ANON_KEY || ANON_KEY.includes("<")) {
+    console.error("Project URL（https://<Reference ID>.supabase.co、/rest/v1 は付けない）と ANON_KEY を入力してください");
     return;
   }
 

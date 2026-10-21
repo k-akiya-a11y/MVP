@@ -288,7 +288,7 @@ where id = (select id from public.human_reviews order by created_at limit 1);
 担当者のセッションのアクセストークンだけを使い、service_role や SQL Editor の管理者権限は使いません。トークンやキーは結果に出しません。
 
 1. 担当者がプレビューにログインし、トップ画面を開いたまま F12 で開発者ツールを開き、Console を選びます。
-2. スクリプトの先頭の `SUPABASE_URL`（`https://<Reference ID>.supabase.co`）と `ANON_KEY`（公開の anon キー）を書き換えて貼り付け、Enter を押します。
+2. スクリプトを書き換えずにそのまま貼り付け、Enter を押します。入力欄が2回出るので、Project URL（`https://<Reference ID>.supabase.co`）と公開の anon キーを入れます（ファイルを手で書き換えると引用符が崩れて SyntaxError になりやすいため）。
    初めて貼り付けるときは、Chrome が `allow pasting` の入力を求めます。
 3. 表の `result` がすべて PASS（対象がない項目は SKIP）であることを確かめます。
 4. `copy(JSON.stringify(window.__permissionCheck, null, 2))` で結果をコピーして記録に残します。
