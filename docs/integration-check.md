@@ -32,7 +32,8 @@
 ## 段階2. Vercel に環境変数を登録する
 
 1. Vercel でこのリポジトリをインポートします。PR #2 のブランチ `claude/project-thread-xd7oh4` に push すると、プレビューが自動で作られます。
-2. Project → Settings → Environment Variables に、次の6つを登録します。対象（Environment）は **Preview** だけにします。
+2. Project → Settings → Environment Variables に、次の6つを登録します。対象（Environments）は Preview のうちブランチ `claude/project-thread-xd7oh4` だけにし、Production と他のブランチは外します。
+   種類（Type）は、`NEXT_PUBLIC_` で始まる2つと `ALLOWED_LOGIN_DOMAIN` を **Config**、残りの3つを **Secret** にします（`NEXT_PUBLIC_` の値はブラウザに渡るため Secret にできません）。
 
    | 名前 | 値 |
    | --- | --- |
@@ -43,7 +44,7 @@
    | `ALLOWED_LOGIN_DOMAIN` | `yuinoyashiro.jp` |
    | `CRON_SECRET` | 十分に長い乱数（例: `openssl rand -hex 32` の出力） |
 
-**確認**: 6つすべてが Preview を対象に登録されていること。
+**確認**: 6つすべてが、ブランチ `claude/project-thread-xd7oh4` の Preview だけを対象に登録されていること。
 
 ## 段階3. Preview を再デプロイする
 
