@@ -237,18 +237,19 @@
   form2.append("file", csv, "perm.csv");
   form2.append("walletId", WALLET_A);
   form2.append("formatId", "bank_generic");
-  appRes = await fetch(`/api/customers/${CUSTOMER_A}/statements`, { method: "POST", body: form2, credentials: "omit" });
-  appText = await appRes.text();
-  results.push({
-    id: "U-6", who: "未認証", operation: "アプリの取込 API（cookie なし）", expected: "拒否（401）",
-    http: appRes.status, actual: appText.slice(0, 120), result: appRes.status === 401 ? "PASS" : "FAIL",
-  });
-  appRes = await fetch(`/api/cron/propose`, { credentials: "omit" });
-  appText = await appRes.text();
-  results.push({
-    id: "U-7", who: "未認証", operation: "候補生成 API（CRON_SECRET なし）", expected: "拒否（401）",
-    http: appRes.status, actual: appText.slice(0, 120), result: appRes.status === 401 ? "PASS" : "FAIL",
-  });
+  // cookie なしの呼出しは、プレビューでは Vercel の保護（Vercel Authentication）がアプリより先に止めるので、
+  // 届かなかったときは SKIP にして、Ken の PowerShell（バイパス用の値だけ付けて cookie なし）で確かめる
+  async function unauthenticatedApp(id, operation, url, init) {
+    try {
+      const res = await fetch(url, { ...init, credentials: "omit" });
+      const text = await res.text();
+      results.push({ id, who: "未認証", operation, expected: "拒否（401）", http: res.status, actual: text.slice(0, 120), result: res.status === 401 ? "PASS" : "FAIL" });
+    } catch (e) {
+      results.push({ id, who: "未認証", operation, expected: "拒否（401）", http: "-", actual: `Vercel の保護でアプリに届かず（${e && e.message}）。PowerShell で確認する`, result: "SKIP" });
+    }
+  }
+  await unauthenticatedApp("U-6", "アプリの取込 API（cookie なし）", `/api/customers/${CUSTOMER_A}/statements`, { method: "POST", body: form2 });
+  await unauthenticatedApp("U-7", "候補生成 API（CRON_SECRET なし）", "/api/cron/propose", {});
 
   // ---- 実行後の状態が変わっていないこと ----
   const after = await snapshot();
