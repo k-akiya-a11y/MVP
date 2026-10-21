@@ -21,6 +21,7 @@
     console.error("Project URL（https://<Reference ID>.supabase.co、/rest/v1 は付けない）と ANON_KEY を入力してください");
     return;
   }
+  console.log(`接続先: ${SUPABASE_URL}`);
 
   // ---- ログイン中のセッションからアクセストークンを取り出す（@supabase/ssr の cookie。分割されていれば結合） ----
   const ref = new URL(SUPABASE_URL).hostname.split(".")[0];
@@ -51,11 +52,18 @@
   const anonHeaders = { apikey: ANON_KEY, "Content-Type": "application/json" };
 
   async function call(method, path, headers, body, extra = {}) {
-    const res = await fetch(`${SUPABASE_URL}${path}`, {
-      method,
-      headers: { ...headers, ...extra },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    let res;
+    try {
+      res = await fetch(`${SUPABASE_URL}${path}`, {
+        method,
+        headers: { ...headers, ...extra },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch (e) {
+      // 通信そのものの失敗（URL の誤り・ネットワーク・拡張機能による遮断など）。どの呼出しかを出して止める
+      console.error(`通信に失敗しました: ${method} ${path.split("?")[0]}（${e && e.message}）`);
+      throw e;
+    }
     const text = await res.text();
     let json = null;
     try {
