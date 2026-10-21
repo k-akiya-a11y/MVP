@@ -26,6 +26,22 @@ freee への書込とメール送信はこの確認に含みません（まだ�
    `NEXT_PUBLIC_SUPABASE_URL`、`NEXT_PUBLIC_SUPABASE_ANON_KEY`、`SUPABASE_SERVICE_ROLE_KEY`、`ANTHROPIC_API_KEY`、
    `ALLOWED_LOGIN_DOMAIN`、`CRON_SECRET`。
 
+## Vercel プレビューで動かす場合
+
+1. Vercel でこのリポジトリをインポートし、ブランチ `claude/project-thread-xd7oh4` のプレビューを出す
+   （PR #2 に push するとプレビューが自動で作られる）。リージョンは `vercel.json` で東京（hnd1）。
+2. Vercel の Settings → Environment Variables に、上の6つを **Preview** を対象にして登録する。
+   値はチャットや PR に書かない。`CRON_SECRET` は十分に長い乱数にする。
+3. Supabase の Authentication → URL Configuration の Redirect URLs に、プレビューの URL を
+   `https://<プレビューのドメイン>/auth/callback` の形で追加する（ブランチごとの固定 URL を使うと作り直しが要らない）。
+4. Google Cloud の OAuth クライアントの「承認済みのリダイレクト URI」には、Supabase が示すコールバック
+   （`https://<プロジェクト>.supabase.co/auth/v1/callback`）を登録する。
+5. Vercel Cron は本番デプロイでしか動かないので、プレビューでは候補生成を手で呼ぶ:
+   `curl -H "Authorization: Bearer <CRON_SECRET>" https://<プレビューのドメイン>/api/cron/propose`
+   プレビューに Vercel の Deployment Protection がかかっている場合は、Settings → Deployment Protection の
+   「Protection Bypass for Automation」で発行した値を `-H "x-vercel-protection-bypass: <値>"` で添える。
+   ブラウザで画面を開くときは、Vercel にログインしていれば保護を通れる。
+
 ## 確認すること
 
 | # | 誰が | 操作 | 期待する結果 | 確かめる場所 |
@@ -42,3 +58,25 @@ freee への書込とメール送信はこの確認に含みません（まだ�
 | 10 | — | ログを UPDATE・DELETE してみる | 拒否される | SQL エディタ |
 
 結果は「成功」「失敗（内容）」「未確認（理由）」に分けて記録する。
+
+## ログの確かめ方（Supabase の SQL エディタ）
+
+```sql
+-- 4: AI判断ログ（1取引1行）。ルール一致は model が null
+select created_at, confidence, model, prompt_version, input_tokens, output_tokens, cost_usd_micros,
+       rule_versions_used, past_entry_ids, ai_unknowns
+from public.ai_decisions order by created_at desc limit 20;
+
+-- 5・7・8: 人の確認ログ（1操作1行）
+select r.created_at, s.display_name, s.role, r.action, r.bulk, r.reason, r.diff, r.review_seconds
+from public.human_reviews r join public.staff_members s on s.user_id = r.reviewer_id
+order by r.created_at;
+
+-- 9: 重複の確認ログ
+select created_at, resolution, reason, reviewer_id from public.duplicate_reviews order by created_at;
+
+-- 10: 追記専用（どちらもエラーになるのが正しい）
+update public.human_reviews set reason = 'x';
+delete from public.ai_decisions;
+```
+
