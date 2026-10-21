@@ -105,17 +105,22 @@
   const before = await snapshot();
 
   // ---- 対象の選定（担当顧客の、確認待ちの最新の仕訳候補） ----
-  const proposed = await select(`bank_transactions?select=id&customer_id=eq.${CUSTOMER_A}&status=eq.proposed`);
-  const proposedIds = (proposed.json || []).map((t) => t.id);
+  // 「高」が確認待ちに残っていなければ、保留中の「高」で試す（担当者は状態に関係なく管理者の判定で拒否される）
+  const open = await select(`bank_transactions?select=id,status&customer_id=eq.${CUSTOMER_A}&status=in.(proposed,on_hold)`);
+  const proposedIds = (open.json || []).filter((t) => t.status === "proposed").map((t) => t.id);
+  const openIds = (open.json || []).map((t) => t.id);
   let target = null;
   let highTarget = null;
-  if (proposedIds.length) {
+  if (openIds.length) {
     const decisions = await select(
-      `latest_ai_decisions?select=id,confidence,bank_transaction_id&bank_transaction_id=in.(${proposedIds.join(",")})`,
+      `latest_ai_decisions?select=id,confidence,bank_transaction_id&bank_transaction_id=in.(${openIds.join(",")})`,
     );
     const list = decisions.json || [];
-    target = list[0] || null;
-    highTarget = list.find((d) => d.confidence === "high") || null;
+    target = list.find((d) => proposedIds.includes(d.bank_transaction_id)) || null;
+    highTarget =
+      list.find((d) => d.confidence === "high" && proposedIds.includes(d.bank_transaction_id)) ||
+      list.find((d) => d.confidence === "high") ||
+      null;
   }
   const suspected = await select(
     `bank_transactions?select=id&customer_id=eq.${CUSTOMER_A}&status=eq.duplicate_suspected&limit=1`,
@@ -147,7 +152,7 @@
     });
     record("S-4", "担当者", "まとめて承認（RPC、bulk=true、確信度「高」）", "拒否（管理者だけ）", r, rejected(r, ADMIN_ONLY));
   } else {
-    results.push({ id: "S-4", who: "担当者", operation: "まとめて承認", expected: "-", http: "-", actual: "確認待ちの「高」がないため実行せず", result: "SKIP" });
+    results.push({ id: "S-4", who: "担当者", operation: "まとめて承認", expected: "-", http: "-", actual: "確認待ち・保留中の「高」がないため実行せず", result: "SKIP" });
   }
   if (suspectedId) {
     const r = await rpc("resolve_suspected_duplicate", { p_bank_transaction_id: suspectedId, p_resolution: "duplicate", p_reason: "権限確認" });
