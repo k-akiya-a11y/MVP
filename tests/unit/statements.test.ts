@@ -170,7 +170,7 @@ describe("importStatementCsv", () => {
   it("読めた行と、照合用の行数・金額0の行を DB に渡す", async () => {
     const g = gateway();
     const result = await importStatementCsv(
-      { customerId: "c", walletId: WALLET, fileName: "oct.csv", formatId: "bank_generic", bytes: fixture("bank_generic_sjis.csv") },
+      { customerId: "c", walletId: WALLET, fileName: "oct.csv", formatId: "bank_generic", walletKind: "bank_account", bytes: fixture("bank_generic_sjis.csv") },
       g,
     );
     expect(result).toMatchObject({ ok: true, importId: "imp-1", insertedCount: 5, ignoredCount: 0 });
@@ -183,7 +183,7 @@ describe("importStatementCsv", () => {
   it("金額0の行は取引にせず、行番号と理由を渡す（黙って捨てない）", async () => {
     const g = gateway();
     const bytes = new TextEncoder().encode("\ufeff日付,摘要,出金,入金\n2026/10/01,A,100,\n2026/10/02,残高照会,0,0\n");
-    const result = await importStatementCsv({ customerId: "c", walletId: WALLET, fileName: "x.csv", formatId: "bank_generic", bytes }, g);
+    const result = await importStatementCsv({ customerId: "c", walletId: WALLET, fileName: "x.csv", formatId: "bank_generic", walletKind: "bank_account", bytes }, g);
     expect(result).toMatchObject({ ok: true, insertedCount: 1, ignoredCount: 1 });
     const args = g.importRows.mock.calls[0]![0];
     expect(args.sourceRowCount).toBe(2);
@@ -193,7 +193,7 @@ describe("importStatementCsv", () => {
   it("1行でも読めなければ明細を登録せず、失敗として理由と行番号を記録する", async () => {
     const g = gateway();
     const bytes = new TextEncoder().encode("\ufeff日付,摘要,出金,入金\n2026/10/01,A,100,\n2026/10/02,B,abc,\n");
-    const result = await importStatementCsv({ customerId: "c", walletId: WALLET, fileName: "x.csv", formatId: "bank_generic", bytes }, g);
+    const result = await importStatementCsv({ customerId: "c", walletId: WALLET, fileName: "x.csv", formatId: "bank_generic", walletKind: "bank_account", bytes }, g);
     expect(result).toMatchObject({ ok: false, failureRecordId: "fail-1" });
     expect(g.importRows).not.toHaveBeenCalled();
     expect(g.recordFailure).toHaveBeenCalledWith(
@@ -201,10 +201,28 @@ describe("importStatementCsv", () => {
     );
   });
 
+  it("CSV の形式と口座の種類が合わなければ取り込まない（銀行明細をカードの口座に入れると、取込済みと判定できず二重に登録される）", async () => {
+    const g = gateway();
+    const result = await importStatementCsv(
+      { customerId: "c", walletId: WALLET, fileName: "oct.csv", formatId: "bank_generic", walletKind: "credit_card", bytes: fixture("bank_generic_sjis.csv") },
+      g,
+    );
+    expect(result).toMatchObject({ ok: false, failureRecordId: "fail-1", errors: [{ line: 0, message: expect.stringContaining("合っていません") }] });
+    expect(g.importRows).not.toHaveBeenCalled();
+
+    const card = gateway();
+    const cardResult = await importStatementCsv(
+      { customerId: "c", walletId: WALLET, fileName: "card.csv", formatId: "card_generic", walletKind: "bank_account", bytes: fixture("card_generic_utf8bom.csv") },
+      card,
+    );
+    expect(cardResult).toMatchObject({ ok: false });
+    expect(card.importRows).not.toHaveBeenCalled();
+  });
+
   it("想定と違う文字コードも失敗として記録する", async () => {
     const g = gateway();
     const bytes = new Uint8Array([0x93, 0xfa, 0xff, 0xff]);
-    const result = await importStatementCsv({ customerId: "c", walletId: WALLET, fileName: "x.csv", formatId: "bank_generic", bytes }, g);
+    const result = await importStatementCsv({ customerId: "c", walletId: WALLET, fileName: "x.csv", formatId: "bank_generic", walletKind: "bank_account", bytes }, g);
     expect(result).toMatchObject({ ok: false, failureRecordId: "fail-1" });
     expect(g.importRows).not.toHaveBeenCalled();
   });

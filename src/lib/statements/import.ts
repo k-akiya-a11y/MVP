@@ -1,4 +1,4 @@
-import { findStatementFormat } from "./formats";
+import { findStatementFormat, type WalletKind } from "./formats";
 import {
   buildDedupeKeys,
   decodeStatement,
@@ -15,6 +15,8 @@ export type StatementImportRow = {
   balance: number | null;
   dedupe_key: string;
 };
+
+const WALLET_KIND_LABELS: Record<WalletKind, string> = { bank_account: "銀行", credit_card: "クレジットカード", wallet: "現金・その他" };
 
 type ImportTarget = { customerId: string; walletId: string; fileName: string; formatId: string };
 
@@ -54,10 +56,10 @@ export type ImportStatementResult =
  * （一部だけ取り込むと、取込漏れの明細に気づけなくなるため）。
  */
 export async function importStatementCsv(
-  input: ImportTarget & { bytes: Uint8Array },
+  input: ImportTarget & { bytes: Uint8Array; walletKind: WalletKind },
   gateway: StatementImportGateway,
 ): Promise<ImportStatementResult> {
-  const { bytes, ...target } = input;
+  const { bytes, walletKind, ...target } = input;
   const fail = async (errors: StatementParseError[], sourceRowCount: number | null): Promise<ImportStatementResult> => {
     // 未対応の形式は取込記録の csv_format に入れられないので、記録せずに返す
     const failureRecordId = findStatementFormat(target.formatId)
@@ -69,6 +71,10 @@ export async function importStatementCsv(
   const format = findStatementFormat(target.formatId);
   if (!format) {
     return fail([{ line: 0, message: `未対応の CSV 形式です: ${target.formatId}` }], null);
+  }
+  // 取込済みかどうかは口座ごとに判定するので、口座を取り違えると同じ明細が別の口座に二重に登録される
+  if (format.walletKind !== walletKind) {
+    return fail([{ line: 0, message: `選んだ口座と CSV の形式が合っていません（${format.label} の形式は${WALLET_KIND_LABELS[format.walletKind]}の口座にだけ取り込めます）` }], null);
   }
   let text: string;
   try {

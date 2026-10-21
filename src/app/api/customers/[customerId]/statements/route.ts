@@ -12,6 +12,8 @@ const formSchema = z.object({
   formatId: z.string().min(1),
 });
 
+const walletSchema = z.object({ kind: z.enum(["bank_account", "credit_card", "wallet"]) });
+
 /**
  * 明細 CSV のアップロード（multipart/form-data: file, walletId, formatId）。
  * 担当者の権限で登録するので、担当外の顧客には RLS で登録できない。外部への書込はしない。
@@ -38,10 +40,26 @@ export async function POST(request: Request, context: { params: Promise<{ custom
     return NextResponse.json({ error: "ファイルが大きすぎます（5MB まで）" }, { status: 413 });
   }
 
+  // 口座の種類（担当外の顧客の口座は RLS で見えない）
+  const { data: wallet, error: walletError } = await supabase
+    .from("wallets")
+    .select("kind")
+    .eq("id", fields.data.walletId)
+    .eq("customer_id", customerId)
+    .maybeSingle();
+  if (walletError) {
+    return NextResponse.json({ error: "口座を確認できませんでした" }, { status: 500 });
+  }
+  const walletKind = walletSchema.safeParse(wallet);
+  if (!walletKind.success) {
+    return NextResponse.json({ error: "口座が見つかりません" }, { status: 404 });
+  }
+
   const result = await importStatementCsv(
     {
       customerId,
       walletId: fields.data.walletId,
+      walletKind: walletKind.data.kind,
       fileName: file.name,
       formatId: fields.data.formatId,
       bytes: new Uint8Array(await file.arrayBuffer()),

@@ -45,14 +45,21 @@ export function UploadForm({ customerId, wallets, formats }: Props) {
   return (
     <form className="upload" onSubmit={onSubmit}>
       <strong>明細CSVの取込</strong>
-      <select name="walletId" required aria-label="口座">
+      {/* 先頭の口座が選ばれたままにならないよう、口座と形式は毎回選んでもらう */}
+      <select name="walletId" required aria-label="口座" defaultValue="">
+        <option value="" disabled>
+          口座を選ぶ
+        </option>
         {wallets.map((w) => (
           <option key={w.id} value={w.id}>
             {w.name}
           </option>
         ))}
       </select>
-      <select name="formatId" required aria-label="CSVの形式">
+      <select name="formatId" required aria-label="CSVの形式" defaultValue="">
+        <option value="" disabled>
+          CSVの形式を選ぶ
+        </option>
         {formats.map((f) => (
           <option key={f.id} value={f.id}>
             {f.label}
