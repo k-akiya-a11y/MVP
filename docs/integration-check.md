@@ -23,7 +23,7 @@
 3. SQL Editor で `supabase/seed/001_sample_customer.sql` の内容を実行します。架空の顧客2社・口座・マスタ・ルール・過去仕訳が入ります。
    seed の架空ユーザー（`admin@example.com`、`staff@example.com`）は Google でログインできないため、確認には使いません。
 4. Project Settings → API Keys（または API）で、次の3つの値を控えます（チャットには書かないでください）。
-   - Project URL
+   - Project URL（`https://<Reference ID>.supabase.co` の形。`/rest/v1` などが付いた URL は使いません。付けるとログインが「No API key found」で失敗します）
    - anon（public）キー
    - service_role キー
 
@@ -37,7 +37,7 @@
 
    | 名前 | 値 |
    | --- | --- |
-   | `NEXT_PUBLIC_SUPABASE_URL` | 段階1で控えた Project URL |
+   | `NEXT_PUBLIC_SUPABASE_URL` | 段階1で控えた Project URL（`https://<Reference ID>.supabase.co` だけ。末尾の `/` や `/rest/v1` は付けない） |
    | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | 段階1で控えた anon キー |
    | `SUPABASE_SERVICE_ROLE_KEY` | 段階1で控えた service_role キー |
    | `ANTHROPIC_API_KEY` | アプリ用の Claude API キー |
