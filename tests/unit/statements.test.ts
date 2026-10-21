@@ -69,6 +69,23 @@ describe("parseStatementCsv", () => {
     expect(result.rows[4]).toMatchObject({ amount: 330000, direction: "income" });
   });
 
+  it("実結合の追加確認用の銀行明細（ルール一致の行を複数含む）を読み、最初の明細とキーが重ならない", () => {
+    const format = findStatementFormat("bank_generic")!;
+    const more = parseStatementCsv(decodeStatement(fixture("bank_generic_sjis_more.csv"), format.encoding), format);
+    expect(more.errors).toEqual([]);
+    expect(more.rows.map((r) => [r.txnDate, r.amount])).toEqual([
+      ["2026-11-27", 9020],
+      ["2026-12-01", 165000],
+      ["2026-12-25", 9020],
+      ["2026-12-26", 1100],
+      ["2026-12-27", 8800],
+      ["2026-12-28", 9020],
+    ]);
+    const first = parseStatementCsv(decodeStatement(fixture("bank_generic_sjis.csv"), format.encoding), format);
+    const firstKeys = new Set(buildDedupeKeys(WALLET, first.rows));
+    expect(buildDedupeKeys(WALLET, more.rows).some((k) => firstKeys.has(k))).toBe(false);
+  });
+
   it("UTF-8（BOM 付き）のカード明細を読み、マイナスは返金（入金）にする", () => {
     const format = findStatementFormat("card_generic")!;
     const result = parseStatementCsv(decodeStatement(fixture("card_generic_utf8bom.csv"), format.encoding), format);

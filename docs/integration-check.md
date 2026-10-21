@@ -265,3 +265,37 @@ E-4. 人の確認ログの削除
 delete from public.human_reviews
 where id = (select id from public.human_reviews order by created_at limit 1);
 ```
+
+## 段階10. 追加確認（未確認だった画面操作・画面を通さない権限・仕訳の正しさ）
+
+段階9までと同じ検証環境・架空データで行います。読むだけの SQL は `/mnt/project-files/integration-check/` にもあります。
+
+### 10-1. 画面操作
+
+| # | 誰が | 操作 | 期待する結果 | 証拠 |
+| --- | --- | --- | --- | --- |
+| a | 担当者 | 確認待ちの1件で、理由欄に空白（全角・半角）だけを入れて保留する | 保留できない（画面で止まり、DB にも記録されない） | 画面、`evidence-transactions.sql` |
+| b | 担当者 | 口座「サンプル銀行 本店 普通」に `bank_generic_sjis.csv` をもう一度取り込む | 登録0件、読み飛ばし5件。明細の総数が増えない | 取込結果の表示、`check-counts.sql` の前後 |
+| c | 担当者 | 同じ口座に `bank_generic_sjis_more.csv` を取り込む | 6件を登録 | 取込結果の表示 |
+| d | Ken | 段階9の 3 と同じ手順で候補生成を呼ぶ | 新しい6件と、段階9で「別の取引」にした1件に候補ができる。ルール一致で金額が過去の範囲内の4件は「高」、1,100円の1件は「中」 | 呼出しの結果 |
+| e | 管理者 | 「高」のタブで4件を選び、1件を理由付きで保留してから、まとめて承認する | 保留した1件は承認されず保留のまま。残り3件が `bulk=true` で承認される | 画面、`evidence-transactions.sql`、ログ照合 B |
+| f | 管理者 | 確認待ちの1件を却下する | 状態が rejected になり、確認ログに reject が残る | `evidence-transactions.sql` |
+| g | 管理者 | トップ画面の「重複の疑い」の数と `check-counts.sql` を比べ、重複の疑いを1件解消して、もう一度比べる | どちらも一致し、解消後に1減る | トップ画面、`check-counts.sql` の前後 |
+
+### 10-2. 画面を通さない権限確認（担当者本人の認証）
+
+`scripts/integration/staff-permission-check.js` を、担当者がログインしたブラウザの開発者ツール（Console）で実行します。
+担当者のセッションのアクセストークンだけを使い、service_role や SQL Editor の管理者権限は使いません。トークンやキーは結果に出しません。
+
+1. 担当者がプレビューにログインし、トップ画面を開いたまま F12 で開発者ツールを開き、Console を選びます。
+2. スクリプトの先頭の `SUPABASE_URL`（`https://<Reference ID>.supabase.co`）と `ANON_KEY`（公開の anon キー）を書き換えて貼り付け、Enter を押します。
+   初めて貼り付けるときは、Chrome が `allow pasting` の入力を求めます。
+3. 表の `result` がすべて PASS（対象がない項目は SKIP）であることを確かめます。
+4. `copy(JSON.stringify(window.__permissionCheck, null, 2))` で結果をコピーして記録に残します。
+
+確かめる内容: 承認・修正・却下・まとめて承認・重複の除外の RPC、確認ログ・明細・役割・担当割当への直接の書込、担当外の顧客の閲覧と取込（RPC・表・アプリの API）、未認証での RPC・閲覧・API。最後に、実行前後で担当顧客の明細の状態・件数と各ログの件数が変わっていないことを比べます。
+
+### 10-3. 仕訳の正しさ
+
+`proposals-first8.sql` で段階9の8件の提案内容を出し、ルール・マスタ・過去仕訳から決めた期待結果と比べます。
+判断材料が足りない明細は「人の確認が必要（確信度「低」、不明点を明示）」を期待結果とします。
