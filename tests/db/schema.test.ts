@@ -352,6 +352,38 @@ describe("明細の取込", () => {
   });
 });
 
+describe("トップ画面の残件数（pending_transaction_counts）", () => {
+  it("1,000件を超えても欠けずに数え、重複の疑いも残件に含める。担当外の顧客は数えない", async () => {
+    await client.query("begin");
+    try {
+      const imp = await client.query<{ id: string }>(
+        `insert into public.statement_imports (customer_id, wallet_id, source) values ($1, $2, 'csv') returning id`,
+        [CUSTOMER_A, WALLET_A],
+      );
+      await client.query(
+        `insert into public.bank_transactions (customer_id, wallet_id, import_id, txn_date, amount, direction, description, dedupe_key)
+         select $1, $2, $3, '2026-10-01', 100 + g, 'expense', 'ｻﾝﾌﾟﾙ', 'cnt-' || g from generate_series(1, 1205) g`,
+        [CUSTOMER_A, WALLET_A, imp.rows[0]!.id],
+      );
+      const original = await client.query<{ id: string }>("select id from public.bank_transactions where dedupe_key = 'cnt-1'");
+      await client.query(
+        `insert into public.bank_transactions (customer_id, wallet_id, import_id, txn_date, amount, direction, description, dedupe_key, status, duplicate_of_id)
+         values ($1, $2, $3, '2026-10-01', 101, 'expense', 'ｻﾝﾌﾟﾙ', 'cnt-1:suspected', 'duplicate_suspected', $4)`,
+        [CUSTOMER_A, WALLET_A, imp.rows[0]!.id, original.rows[0]!.id],
+      );
+      await client.query("select set_config('request.jwt.claim.sub', $1, true)", [STAFF_ID]);
+      await client.query("set local role authenticated");
+      const counts = await client.query("select customer_id, status, count from public.pending_transaction_counts order by status");
+      expect(counts.rows).toEqual([
+        { customer_id: CUSTOMER_A, status: "duplicate_suspected", count: 1 },
+        { customer_id: CUSTOMER_A, status: "new", count: 1205 },
+      ]);
+    } finally {
+      await client.query("rollback");
+    }
+  });
+});
+
 describe("重複の疑いの確認（resolve_suspected_duplicate）", () => {
   const card = [{ txn_date: "2026-10-05", amount: 550, direction: "expense", description: "ｻﾝﾌﾟﾙｺﾝﾋﾞﾆ", balance: null, dedupe_key: "c1" }];
 
@@ -494,15 +526,60 @@ describe("人の確認の記録（record_human_review）", () => {
     return { txnId: txn.rows[0]!.id, decisionId: decision.rows[0]!.id };
   }
 
-  const review = (decisionId: string, action: string, entry: object | null = null, bulk = false) =>
+  const review = (
+    decisionId: string,
+    action: string,
+    entry: object | null = null,
+    bulk = false,
+    reason: string | null = action === "hold" ? "請求書の到着待ち" : null,
+  ) =>
     client.query<{ id: string }>("select public.record_human_review($1, $2, $3, $4, $5, $6) as id", [
       decisionId,
       action,
       entry === null ? null : JSON.stringify(entry),
-      null,
+      reason,
       7,
       bulk,
     ]);
+
+  const asUser = async (userId: string) => {
+    await client.query("reset role");
+    await client.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
+    await client.query("set local role authenticated");
+  };
+
+  it("保留には理由が必須（空白・全角空白・改行だけの理由も拒否する）", () =>
+    inTx(async () => {
+      const { decisionId } = await setup("high", PROPOSAL, STAFF_ID);
+      for (const reason of [null, "", "   ", "　\n\t　"]) {
+        const message = await expectQueryError(client, "select public.record_human_review($1, 'hold', null, $2, 1, false)", [decisionId, reason]);
+        expect(message).toMatch(/保留の理由を入力してください/);
+      }
+    }));
+
+  it("担当者が理由付きで保留 → 管理者が理由・保留者・日時を見て、1件ずつ承認できる", () =>
+    inTx(async () => {
+      const { txnId, decisionId } = await setup("high", PROPOSAL, STAFF_ID);
+      await review(decisionId, "hold", null, false, "  インボイス番号を顧客に確認中　");
+
+      await asUser(ADMIN_ID);
+      const holds = await client.query(
+        `select r.reason, r.reviewer_id, s.display_name, r.created_at is not null as has_time
+         from public.human_reviews r join public.staff_members s on s.user_id = r.reviewer_id
+         where r.ai_decision_id = $1 and r.action = 'hold'`,
+        [decisionId],
+      );
+      // 前後の空白は除いて記録する
+      expect(holds.rows).toEqual([
+        { reason: "インボイス番号を顧客に確認中", reviewer_id: STAFF_ID, display_name: expect.any(String), has_time: true },
+      ]);
+      const bulk = await expectQueryError(client, "select public.record_human_review($1, 'approve', null, null, 1, true)", [decisionId]);
+      expect(bulk).toMatch(/保留中の明細はまとめて承認できません/);
+      await review(decisionId, "approve");
+      expect((await client.query("select status from public.bank_transactions where id = $1", [txnId])).rows[0]).toEqual({ status: "approved" });
+      const actions = await client.query("select action, reviewer_id from public.human_reviews where ai_decision_id = $1 order by created_at, action desc", [decisionId]);
+      expect(actions.rows.map((r) => r.action).sort()).toEqual(["approve", "hold"]);
+    }));
 
   async function inTx(fn: () => Promise<void>) {
     await client.query("begin");
