@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import type { AiDecisionRow } from "../audit/decision-log";
+import { fetchAll } from "../supabase/fetch-all";
 import type { CustomerContext } from "./propose";
 import type { BankTransaction, MasterEntry, PastEntry, RuleVersion } from "./types";
 
@@ -117,21 +118,44 @@ export function supabaseProposalStore(client: SupabaseClient): ProposalStore {
     async loadCustomerContext(customerId, onDate) {
       const [customer, masters, rules, notes, past, wallets] = await Promise.all([
         client.from("customers").select("id, name, tax_method, invoice_registered, low_confidence_amount_threshold").eq("id", customerId).single(),
-        client.from("freee_masters").select("kind, freee_id, name, attrs").eq("customer_id", customerId).eq("available", true),
-        client.from("current_journal_rules").select("*").eq("customer_id", customerId),
-        client.from("current_customer_notes").select("note_id, version, status, title, body").eq("customer_id", customerId),
-        client
-          .from("past_journal_entries")
-          .select("id, entry_date, amount, direction, bank_description, partner_key, account_item_id, tax_code, partner_id, item_id, section_id, tag_ids, description")
-          .eq("customer_id", customerId)
-          .gte("entry_date", shiftYears(onDate, -2)),
-        client.from("wallets").select("id, name").eq("customer_id", customerId),
+        fetchAll("マスタ", (from, to) =>
+          client
+            .from("freee_masters")
+            .select("kind, freee_id, name, attrs")
+            .eq("customer_id", customerId)
+            .eq("available", true)
+            .order("kind")
+            .order("freee_id")
+            .range(from, to),
+        ),
+        fetchAll("ルール", (from, to) =>
+          client.from("current_journal_rules").select("*").eq("customer_id", customerId).order("rule_id").range(from, to),
+        ),
+        fetchAll("メモ", (from, to) =>
+          client
+            .from("current_customer_notes")
+            .select("note_id, version, status, title, body")
+            .eq("customer_id", customerId)
+            .order("note_id")
+            .range(from, to),
+        ),
+        // 過去一致率を一部のデータで計算しないよう、24か月分を全件読む
+        fetchAll("過去仕訳", (from, to) =>
+          client
+            .from("past_journal_entries")
+            .select("id, entry_date, amount, direction, bank_description, partner_key, account_item_id, tax_code, partner_id, item_id, section_id, tag_ids, description")
+            .eq("customer_id", customerId)
+            .gte("entry_date", shiftYears(onDate, -2))
+            .order("id")
+            .range(from, to),
+        ),
+        fetchAll("口座", (from, to) => client.from("wallets").select("id, name").eq("customer_id", customerId).order("id").range(from, to)),
       ]);
 
       const c = customerRow.parse(check(customer, "顧客"));
       const masterEntries: MasterEntry[] = z
         .array(masterRow)
-        .parse(check(masters, "マスタ"))
+        .parse(masters)
         .map((m) => ({
           kind: m.kind,
           id: m.freee_id,
@@ -141,7 +165,7 @@ export function supabaseProposalStore(client: SupabaseClient): ProposalStore {
         }));
       const activeRules: RuleVersion[] = z
         .array(ruleRow)
-        .parse(check(rules, "ルール"))
+        .parse(rules)
         .filter((r) => r.status === "active")
         .map((r) => ({
           ruleId: r.rule_id,
@@ -171,12 +195,12 @@ export function supabaseProposalStore(client: SupabaseClient): ProposalStore {
         }));
       const activeNotes = z
         .array(z.object({ note_id: z.string(), version: int, status: z.string(), title: z.string(), body: z.string() }))
-        .parse(check(notes, "メモ"))
+        .parse(notes)
         .filter((n) => n.status === "active")
         .map((n) => ({ noteId: n.note_id, version: n.version, title: n.title, body: n.body }));
       const pastEntries: PastEntry[] = z
         .array(pastRow)
-        .parse(check(past, "過去仕訳"))
+        .parse(past)
         .map((p) => ({
           id: p.id,
           entryDate: p.entry_date,
@@ -197,7 +221,7 @@ export function supabaseProposalStore(client: SupabaseClient): ProposalStore {
       const walletNames = new Map(
         z
           .array(z.object({ id: z.string(), name: z.string() }))
-          .parse(check(wallets, "口座"))
+          .parse(wallets)
           .map((w) => [w.id, w.name] as const),
       );
 

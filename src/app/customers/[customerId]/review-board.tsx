@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EntryJson, MasterOption, ReviewItem, ReviewQueue } from "@/lib/review/queue";
+import { bulkApprovalTargets } from "@/lib/review/selection";
 import { bulkApproveAction, reviewAction } from "./actions";
 
 type Tab = "high" | "medium" | "low" | "on_hold";
@@ -34,13 +35,16 @@ const emptyEntry = (): EntryJson => ({
  * 承認画面（設計書7章）。明細・AI の案・根拠を並べ、キーボードだけで操作できる。
  * j / k: 前後の明細、a: 承認、e: 修正、h: 保留、x: 却下、Space: 選択（高のみ）、Shift+A: 選択分をまとめて承認
  * 表示から確定までの秒数を記録する（KPI「人間作業時間」の補助データ）。
+ * 承認・修正・却下は承認者（管理者）だけ。担当者は理由を添えて保留にする（DB の関数でも同じ判定をする）。
  */
 export function ReviewBoard({
   customerId,
+  canApprove,
   items,
   masters,
 }: {
   customerId: string;
+  canApprove: boolean;
   items: ReviewItem[];
   masters: ReviewQueue["masters"];
 }) {
@@ -56,6 +60,18 @@ export function ReviewBoard({
 
   const visible = useMemo(() => items.filter((i) => inTab(i, tab)), [items, tab]);
   const current = visible[Math.min(index, Math.max(visible.length - 1, 0))];
+  // まとめて承認の対象は「いま高のタブに表示されている明細」のうち選択したものだけ。
+  // 保留・却下などで一覧から外れた明細の ID が選択に残っても、送らない。
+  const bulkTargets = useMemo(() => (tab === "high" ? bulkApprovalTargets(visible, selected) : []), [selected, tab, visible]);
+
+  // 一覧が変わったら（確認後の再読込など）、表示されていない明細を選択から外す
+  useEffect(() => {
+    const shown = new Set(visible.map((v) => v.decisionId));
+    setSelected((s) => {
+      const next = new Set([...s].filter((id) => shown.has(id)));
+      return next.size === s.size ? s : next;
+    });
+  }, [visible]);
 
   const name = useCallback(
     (kind: keyof ReviewQueue["masters"], id: number | null) =>
@@ -78,8 +94,17 @@ export function ReviewBoard({
   const act = useCallback(
     async (action: "approve" | "correct" | "hold" | "reject", entry: EntryJson | null = null) => {
       if (!current || busy) return;
+      if (action !== "hold" && !canApprove) return;
       setBusy(true);
       setMessage(null);
+      // 確認した明細は、結果にかかわらずまとめて承認の選択から外す（保留した明細が混ざらないように）
+      const decided = current.decisionId;
+      setSelected((s) => {
+        if (!s.has(decided)) return s;
+        const next = new Set(s);
+        next.delete(decided);
+        return next;
+      });
       try {
         const result = await reviewAction(customerId, {
           decisionId: current.decisionId,
@@ -94,18 +119,18 @@ export function ReviewBoard({
         setBusy(false);
       }
     },
-    [busy, current, customerId, reason],
+    [busy, canApprove, current, customerId, reason],
   );
 
   const bulkApprove = useCallback(async () => {
-    if (selected.size === 0 || busy) return;
+    if (!canApprove || bulkTargets.length === 0 || busy) return;
     setBusy(true);
     try {
       // まとめて承認は一覧を見ていた時間を件数で割って1件あたりの秒数にする
-      const perItem = Math.round(secondsSince(tabShownAt.current) / selected.size);
+      const perItem = Math.round(secondsSince(tabShownAt.current) / bulkTargets.length);
       const result = await bulkApproveAction(
         customerId,
-        [...selected].map((decisionId) => ({ decisionId, reviewSeconds: perItem })),
+        bulkTargets.map((item) => ({ decisionId: item.decisionId, reviewSeconds: perItem })),
       );
       setSelected(new Set());
       tabShownAt.current = Date.now();
@@ -117,7 +142,7 @@ export function ReviewBoard({
     } finally {
       setBusy(false);
     }
-  }, [busy, customerId, selected]);
+  }, [bulkTargets, busy, canApprove, customerId]);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -125,12 +150,12 @@ export function ReviewBoard({
       if (editing || ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName)) return;
       if (e.key === "j") setIndex((i) => Math.min(i + 1, visible.length - 1));
       else if (e.key === "k") setIndex((i) => Math.max(i - 1, 0));
-      else if (e.key === "A" && e.shiftKey && tab === "high") void bulkApprove();
-      else if (e.key === "a" && current?.proposal) void act("approve");
-      else if (e.key === "e" && current) setEditing(current.proposal ? { ...current.proposal } : emptyEntry());
+      else if (e.key === "A" && e.shiftKey && tab === "high" && canApprove) void bulkApprove();
+      else if (e.key === "a" && current?.proposal && canApprove) void act("approve");
+      else if (e.key === "e" && current && canApprove) setEditing(current.proposal ? { ...current.proposal } : emptyEntry());
       else if (e.key === "h" && current && tab !== "on_hold") void act("hold");
-      else if (e.key === "x" && current) void act("reject");
-      else if (e.key === " " && current && tab === "high") {
+      else if (e.key === "x" && current && canApprove) void act("reject");
+      else if (e.key === " " && current && tab === "high" && canApprove) {
         e.preventDefault();
         setSelected((s) => {
           const next = new Set(s);
@@ -143,7 +168,7 @@ export function ReviewBoard({
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [act, bulkApprove, current, editing, tab, visible.length]);
+  }, [act, bulkApprove, canApprove, current, editing, tab, visible.length]);
 
   return (
     <section>
@@ -154,16 +179,20 @@ export function ReviewBoard({
           </button>
         ))}
       </nav>
-      <p className="note">j / k: 移動、a: 承認、e: 修正、h: 保留、x: 却下{tab === "high" && "、Space: 選択、Shift+A: 選択分をまとめて承認"}</p>
+      {canApprove ? (
+        <p className="note">j / k: 移動、a: 承認、e: 修正、h: 保留、x: 却下{tab === "high" && "、Space: 選択、Shift+A: 選択分をまとめて承認"}</p>
+      ) : (
+        <p className="note">j / k: 移動、h: 保留。承認・修正・却下は承認者（管理者）が行います。気づいたことは理由に書いて保留にしてください。</p>
+      )}
       {message && <p className="error">{message}</p>}
 
-      {tab === "high" && visible.length > 0 && (
+      {tab === "high" && canApprove && visible.length > 0 && (
         <p>
           <button type="button" onClick={() => setSelected(new Set(visible.map((v) => v.decisionId)))}>
             すべて選択
           </button>{" "}
-          <button type="button" disabled={selected.size === 0 || busy} onClick={() => void bulkApprove()}>
-            選択した {selected.size} 件をまとめて承認
+          <button type="button" disabled={bulkTargets.length === 0 || busy} onClick={() => void bulkApprove()}>
+            選択した {bulkTargets.length} 件をまとめて承認
           </button>
         </p>
       )}
@@ -172,7 +201,7 @@ export function ReviewBoard({
         <table className="list">
           <thead>
             <tr>
-              {tab === "high" && <th />}
+              {tab === "high" && canApprove && <th />}
               <th>日付</th>
               <th className="num">金額</th>
               <th>摘要</th>
@@ -183,7 +212,7 @@ export function ReviewBoard({
           <tbody>
             {visible.map((item, i) => (
               <tr key={item.decisionId} className={item === current ? "current" : ""} onClick={() => setIndex(i)}>
-                {tab === "high" && (
+                {tab === "high" && canApprove && (
                   <td>
                     <input
                       type="checkbox"
@@ -254,21 +283,31 @@ export function ReviewBoard({
                 ) : (
                   <p>提案はありません。内容を確認して入力してください（e）。</p>
                 )}
+                <label>
+                  理由・メモ（保留・却下のとき）
+                  <input value={reason} onChange={(e) => setReason(e.target.value)} maxLength={1000} />
+                </label>
                 <div className="actions">
-                  <button type="button" disabled={!current.proposal || busy} onClick={() => void act("approve")}>
-                    承認 (a)
-                  </button>
-                  <button type="button" disabled={busy} onClick={() => setEditing(current.proposal ? { ...current.proposal } : emptyEntry())}>
-                    修正 (e)
-                  </button>
+                  {canApprove && (
+                    <>
+                      <button type="button" disabled={!current.proposal || busy} onClick={() => void act("approve")}>
+                        承認 (a)
+                      </button>
+                      <button type="button" disabled={busy} onClick={() => setEditing(current.proposal ? { ...current.proposal } : emptyEntry())}>
+                        修正 (e)
+                      </button>
+                    </>
+                  )}
                   {tab !== "on_hold" && (
                     <button type="button" disabled={busy} onClick={() => void act("hold")}>
                       保留 (h)
                     </button>
                   )}
-                  <button type="button" disabled={busy} onClick={() => void act("reject")}>
-                    却下 (x)
-                  </button>
+                  {canApprove && (
+                    <button type="button" disabled={busy} onClick={() => void act("reject")}>
+                      却下 (x)
+                    </button>
+                  )}
                 </div>
               </>
             )}

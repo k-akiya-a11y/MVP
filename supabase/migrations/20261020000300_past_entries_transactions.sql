@@ -47,6 +47,8 @@ create table public.statement_imports (
   imported_at timestamptz not null default now(),
   row_count integer not null default 0 check (row_count >= 0),
   skipped_duplicate_count integer not null default 0 check (skipped_duplicate_count >= 0),
+  -- 取込済みの明細と区別できず、人の確認に回した件数
+  suspected_duplicate_count integer not null default 0 check (suspected_duplicate_count >= 0),
   foreign key (wallet_id, customer_id) references public.wallets (id, customer_id),
   unique (id, customer_id)
 );
@@ -65,17 +67,23 @@ create table public.bank_transactions (
   description text not null,
   balance bigint,
   freee_wallet_txn_id bigint,
-  -- 重複取込を防ぐキー（口座・日付・金額・入出金・摘要・同日同内容の連番から作る）
+  -- 重複取込を防ぐキー（口座・日付・金額・入出金・摘要・残高・同じファイル内の連番から作る）
   dedupe_key text not null,
   -- 処理状況: 未判定 → 候補作成済 → 承認済 → freee 登録済。保留・却下もある。
+  -- 取込済みの明細と区別できない行は「重複の疑い」で止め、人が「別の取引」か「重複」かを決める。
   status text not null default 'new'
-    check (status in ('new', 'proposed', 'approved', 'registered', 'on_hold', 'rejected')),
+    check (status in ('new', 'proposed', 'approved', 'registered', 'on_hold', 'rejected',
+                      'duplicate_suspected', 'duplicate')),
+  -- 重複の疑いがあるとき、同じキーを持つ取込済みの明細
+  duplicate_of_id uuid,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (customer_id, dedupe_key),
   unique (id, customer_id),
   foreign key (wallet_id, customer_id) references public.wallets (id, customer_id),
-  foreign key (import_id, customer_id) references public.statement_imports (id, customer_id)
+  foreign key (import_id, customer_id) references public.statement_imports (id, customer_id),
+  foreign key (duplicate_of_id, customer_id) references public.bank_transactions (id, customer_id),
+  check ((status = 'duplicate_suspected') <= (duplicate_of_id is not null))
 );
 
 create unique index bank_transactions_freee_uniq
@@ -121,4 +129,7 @@ create policy bank_transactions_select on public.bank_transactions
   for select to authenticated using (public.can_access_customer(customer_id));
 create policy bank_transactions_insert on public.bank_transactions
   for insert to authenticated
-  with check (public.can_access_customer(customer_id) and status = 'new');
+  with check (
+    public.can_access_customer(customer_id)
+    and (status = 'new' or (status = 'duplicate_suspected' and duplicate_of_id is not null))
+  );

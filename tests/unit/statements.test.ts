@@ -104,6 +104,18 @@ describe("buildDedupeKeys", () => {
     expect(buildDedupeKeys(WALLET, rows)).toEqual(keys);
     expect(buildDedupeKeys("20000000-0000-4000-8000-000000000002", rows)).not.toEqual(keys);
   });
+
+  it("同日・同額・同摘要でも残高が違えば別のキー（別の CSV に1件ずつ入っていても区別できる）", () => {
+    const row = { line: 2, txnDate: "2026-10-05", amount: 550, direction: "expense" as const, description: "ｻﾝﾌﾟﾙｺﾝﾋﾞﾆ" };
+    const [a] = buildDedupeKeys(WALLET, [{ ...row, balance: 10000 }]);
+    const [b] = buildDedupeKeys(WALLET, [{ ...row, balance: 9450 }]);
+    expect(a).not.toBe(b);
+  });
+
+  it("残高がなければ同じキーになる（DB 側で捨てずに「重複の疑い」に回す）", () => {
+    const row = { line: 2, txnDate: "2026-10-05", amount: 550, direction: "expense" as const, description: "ｻﾝﾌﾟﾙｺﾝﾋﾞﾆ", balance: null };
+    expect(buildDedupeKeys(WALLET, [row])).toEqual(buildDedupeKeys(WALLET, [{ ...row, line: 9 }]));
+  });
 });
 
 describe("importStatementCsv", () => {
@@ -111,6 +123,7 @@ describe("importStatementCsv", () => {
     importId: "imp-1",
     insertedCount: rows.length,
     skippedDuplicateCount: 0,
+    suspectedDuplicateCount: 0,
   });
 
   it("読めた行を DB に渡す", async () => {
@@ -119,7 +132,7 @@ describe("importStatementCsv", () => {
       { customerId: "c", walletId: WALLET, fileName: "oct.csv", formatId: "bank_generic", bytes: fixture("bank_generic_sjis.csv") },
       gateway,
     );
-    expect(result).toEqual({ ok: true, importId: "imp-1", insertedCount: 5, skippedDuplicateCount: 0 });
+    expect(result).toEqual({ ok: true, importId: "imp-1", insertedCount: 5, skippedDuplicateCount: 0, suspectedDuplicateCount: 0 });
     expect(gateway.mock.calls[0]![0].rows[1]).toMatchObject({
       txn_date: "2026-10-27",
       amount: 9020,

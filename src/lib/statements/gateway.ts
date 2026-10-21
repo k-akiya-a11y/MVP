@@ -8,6 +8,7 @@ const resultSchema = z
       import_id: z.string().uuid(),
       inserted_count: z.number().int(),
       skipped_duplicate_count: z.number().int(),
+      suspected_duplicate_count: z.number().int(),
     }),
   )
   .length(1);
@@ -29,6 +30,7 @@ export function supabaseStatementImportGateway(client: SupabaseClient): Statemen
       importId: row!.import_id,
       insertedCount: row!.inserted_count,
       skippedDuplicateCount: row!.skipped_duplicate_count,
+      suspectedDuplicateCount: row!.suspected_duplicate_count,
     };
   };
 }

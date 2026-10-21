@@ -25,11 +25,17 @@ export function UploadForm({ customerId, wallets, formats }: Props) {
         body: new FormData(event.currentTarget),
       });
       const body = (await res.json()) as
-        | { ok: true; insertedCount: number; skippedDuplicateCount: number }
+        | { ok: true; insertedCount: number; skippedDuplicateCount: number; suspectedDuplicateCount: number }
         | { ok: false; errors: { line: number; message: string }[] }
         | { error: string };
       if ("error" in body) setMessage(body.error);
-      else if (body.ok) setMessage(`${body.insertedCount}件を取り込みました（取込済みのため読み飛ばし ${body.skippedDuplicateCount}件）`);
+      else if (body.ok)
+        setMessage(
+          `${body.insertedCount}件を取り込みました（取込済みのため読み飛ばし ${body.skippedDuplicateCount}件）` +
+            (body.suspectedDuplicateCount
+              ? `。取込済みの明細と区別できない ${body.suspectedDuplicateCount}件は「重複の疑い」で確認してください`
+              : ""),
+        );
       else setMessage(`取り込めませんでした: ${body.errors.slice(0, 5).map((e) => `${e.line}行目 ${e.message}`).join(" / ")}`);
       router.refresh();
     } finally {

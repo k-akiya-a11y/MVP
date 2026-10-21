@@ -45,3 +45,28 @@ export async function submitReview(client: SupabaseClient, input: ReviewInput): 
   if (error) return { ok: false, error: error.message };
   return { ok: true, reviewId: z.string().parse(data) };
 }
+
+export const duplicateResolutionSchema = z.object({
+  bankTransactionId: z.string().uuid(),
+  resolution: z.enum(["distinct", "duplicate"]),
+  reason: z.string().max(1000).nullable(),
+});
+export type DuplicateResolutionInput = z.infer<typeof duplicateResolutionSchema>;
+
+/**
+ * 重複の疑いがある明細を「別の取引」か「重複」に決める（resolve_suspected_duplicate）。
+ * 「重複」として除外できるのは承認者（管理者）だけで、DB 側で確かめる。
+ */
+export async function submitDuplicateResolution(
+  client: SupabaseClient,
+  input: DuplicateResolutionInput,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const parsed = duplicateResolutionSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, error: parsed.error.issues[0]?.message ?? "入力が不正です" };
+  const { error } = await client.rpc("resolve_suspected_duplicate", {
+    p_bank_transaction_id: parsed.data.bankTransactionId,
+    p_resolution: parsed.data.resolution,
+    p_reason: parsed.data.reason,
+  });
+  return error ? { ok: false, error: error.message } : { ok: true };
+}

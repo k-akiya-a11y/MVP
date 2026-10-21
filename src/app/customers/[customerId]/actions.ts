@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { submitReview, type ReviewInput } from "@/lib/review/submit";
+import { submitDuplicateResolution, submitReview, type DuplicateResolutionInput, type ReviewInput } from "@/lib/review/submit";
 import { createUserClient } from "@/lib/supabase/server";
 
 /** 承認・修正・保留・却下を1件記録する（freee への登録はしない。承認済みの実行は別の層が行う） */
@@ -29,4 +29,12 @@ export async function bulkApproveAction(customerId: string, items: { decisionId:
   }
   revalidatePath(`/customers/${customerId}`);
   return { approved: items.length - failures.length, failures };
+}
+
+/** 重複の疑いがある明細を「別の取引」か「重複」に決める */
+export async function resolveDuplicateAction(customerId: string, input: DuplicateResolutionInput) {
+  const client = await createUserClient();
+  const result = await submitDuplicateResolution(client, input);
+  revalidatePath(`/customers/${customerId}`);
+  return result;
 }

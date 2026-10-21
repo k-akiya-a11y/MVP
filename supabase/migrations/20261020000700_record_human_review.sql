@@ -1,6 +1,9 @@
 -- 人の確認（承認・修正・保留・却下）を記録する唯一の入口。
 -- 1トランザクションで、確認ログの追記・明細の状態更新・承認内容の過去仕訳への追加（設計書6章「学習」）を行う。
 -- security definer なので、閲覧範囲（can_access_customer）と確認者（auth.uid()）はこの関数の中で確かめる。
+--
+-- 承認者（設計書10章 決めること3）: 確定につながる操作（承認・修正・却下）は管理者だけが行える。
+-- 担当者ができるのは保留（理由を添えて管理者に回す）だけ。
 
 -- 担当者が human_reviews に直接書くことは止め、この関数だけを通す
 revoke insert on public.human_reviews from authenticated;
@@ -97,6 +100,11 @@ begin
     raise exception '仕訳候補が見つかりません' using errcode = 'no_data_found';
   end if;
 
+  if p_action in ('approve', 'correct', 'reject') and not public.is_admin() then
+    raise exception '承認・修正・却下は承認者（管理者）だけが行えます。保留にして理由を残してください'
+      using errcode = 'insufficient_privilege';
+  end if;
+
   select * into t from public.bank_transactions where id = d.bank_transaction_id for update;
   if t.status not in ('proposed', 'on_hold') then
     raise exception 'この明細はすでに確認済みです（%）', t.status;
@@ -111,6 +119,10 @@ begin
 
   if p_bulk and (p_action <> 'approve' or d.confidence <> 'high') then
     raise exception 'まとめて承認できるのは確信度「高」だけです';
+  end if;
+  -- 保留した明細は、保留の理由を見たうえで1件ずつ確認する
+  if p_bulk and t.status <> 'proposed' then
+    raise exception '保留中の明細はまとめて承認できません。1件ずつ確認してください';
   end if;
 
   if p_action = 'approve' then

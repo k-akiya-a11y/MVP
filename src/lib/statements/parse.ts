@@ -121,14 +121,25 @@ export function parseStatementCsv(text: string, format: StatementCsvFormat): Sta
 }
 
 /**
- * 重複取込を防ぐキー。口座・日付・入出金・金額・摘要が同じ行が同じファイルに複数あるときは
- * 出現順の連番で区別する（同日に同額のコンビニ払いが2回、など）。
+ * 重複取込を防ぐキー。口座・日付・入出金・金額・摘要・残高から作り、同じ内容の行が同じファイルに
+ * 複数あるときは出現順の連番で区別する（同日に同額のコンビニ払いが2回、など）。
  * 期間が重なる CSV を取り込み直しても、同じ取引は同じキーになる。
+ *
+ * 残高がある行は残高まで一致して初めて同じキーになるので、取込済みなら読み飛ばしてよい。
+ * 残高がない行（カード明細など）は、別の CSV に入った同日・同額・同摘要の別取引と区別できないため、
+ * DB 側（import_bank_statement）で捨てずに「重複の疑い」として人の確認に回す。
  */
 export function buildDedupeKeys(walletId: string, rows: readonly ParsedStatementRow[]): string[] {
   const seen = new Map<string, number>();
   return rows.map((row) => {
-    const base = [walletId, row.txnDate, row.direction, row.amount, row.description.normalize("NFKC")].join("\u001f");
+    const base = [
+      walletId,
+      row.txnDate,
+      row.direction,
+      row.amount,
+      row.description.normalize("NFKC"),
+      row.balance ?? "",
+    ].join("\u001f");
     const n = (seen.get(base) ?? 0) + 1;
     seen.set(base, n);
     return createHash("sha256").update(`${base}\u001f${n}`).digest("hex");

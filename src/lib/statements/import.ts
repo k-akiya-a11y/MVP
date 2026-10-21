@@ -17,10 +17,21 @@ export type StatementImportGateway = (args: {
   fileName: string;
   formatId: string;
   rows: StatementImportRow[];
-}) => Promise<{ importId: string; insertedCount: number; skippedDuplicateCount: number }>;
+}) => Promise<ImportCounts>;
+
+/**
+ * 取込の件数。skipped は残高まで一致した取込済みの行（読み飛ばし）、
+ * suspected は取込済みの行と区別できず「重複の疑い」として確認に回した行。
+ */
+export type ImportCounts = {
+  importId: string;
+  insertedCount: number;
+  skippedDuplicateCount: number;
+  suspectedDuplicateCount: number;
+};
 
 export type ImportStatementResult =
-  | { ok: true; importId: string; insertedCount: number; skippedDuplicateCount: number }
+  | ({ ok: true } & ImportCounts)
   | { ok: false; errors: StatementParseError[] };
 
 /**
