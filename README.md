@@ -5,6 +5,7 @@
 - 技術設計書: [docs/design.md](docs/design.md)
 - MVP開発依頼書: [docs/requirements.md](docs/requirements.md)
 - 開発ルール（Claude Code / Codex 共通）: [CLAUDE.md](CLAUDE.md) ＝ [AGENTS.md](AGENTS.md)
+- 本番公開の保留と解除の手順（Vercel）: [docs/deployment-hold.md](docs/deployment-hold.md)
 
 ## MVPの機能
 
