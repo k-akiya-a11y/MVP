@@ -299,3 +299,20 @@ where id = (select id from public.human_reviews order by created_at limit 1);
 
 `proposals-first8.sql` で段階9の8件の提案内容を出し、ルール・マスタ・過去仕訳から決めた期待結果と比べます。
 判断材料が足りない明細は「人の確認が必要（確信度「低」、不明点を明示）」を期待結果とします。
+
+## 段階11. 仕訳精度の再検証（検証専用の顧客、期待値を事前に固定）
+
+段階9〜10のサンプル商事には、誤取込5件・そこから承認されて過去仕訳になった3件・意図的な操作テストの入力が残っています。これらは監査記録として残し、精度の検証は別の顧客「検証用商事株式会社」で行います（過去仕訳の検索は顧客ごとなので、サンプル商事のデータは参照されません）。
+
+データと期待結果は [tests/fixtures/verification/README.md](../tests/fixtures/verification/README.md) にあり、候補生成の前に固定しています。ファイルは `/mnt/project-files/integration-check/verification/` にも置いてあります。
+
+| # | 誰が | 操作 | 期待する結果 |
+| --- | --- | --- | --- |
+| 1 | Ken | SQL Editor で `supabase/migrations/20261022000100_import_wallet_kind_check.sql` を実行する（段階10で見つかった不具合の DB 側の対策。まだなら） | `Success` |
+| 2 | Ken | SQL Editor で `tests/fixtures/verification/verification_customer.sql` を実行する | `Success`。トップ画面に「検証用商事株式会社」が増える |
+| 3 | Ken | 検証用商事の取込画面で、口座「検証銀行 本店 普通」・形式「銀行」を選び `bank_generic_sjis.csv`（verification の方）を取り込む | 登録8件 |
+| 4 | Ken | 同じ画面で、口座「検証カード」・形式「クレジットカード」を選び `card_generic_sjis.csv` を取り込む | 登録4件 |
+| 5 | Ken | 段階9の 3 と同じ手順で候補生成を呼ぶ | `processed` に12件以上、`failures` が空 |
+| 6 | Ken | SQL Editor で `proposals-verification.sql` を実行し、結果を CSV でこのスレッドに貼る | 12行 |
+
+結果は README の期待結果と突き合わせ、「候補生成の成功」「期待値との一致（確定項目のみ）」「業務判断が未確定（集計しない）」の3つに分けて `docs/integration-results/` に記録します。
