@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { parseCsv } from "@/lib/statements/csv";
-import { findStatementFormat } from "@/lib/statements/formats";
+import { STATEMENT_CSV_FORMATS, findStatementFormat } from "@/lib/statements/formats";
 import { importStatementCsv, type StatementImportGateway } from "@/lib/statements/import";
 import { buildDedupeKeys, decodeStatement, parseStatementCsv } from "@/lib/statements/parse";
 import { parseStatementDate, parseYen } from "@/lib/statements/values";
@@ -109,6 +109,14 @@ describe("parseStatementCsv", () => {
   it("見出しがなければ誤り", () => {
     const format = findStatementFormat("bank_generic")!;
     expect(parseStatementCsv("a,b,c\n1,2,3\n", format).errors[0]?.message).toMatch(/見出し行/);
+  });
+});
+
+describe("CSV の形式と口座の種類の対応", () => {
+  it("アプリの形式定義と DB の取込関数（statement_csv_format_wallet_kind）が同じ対応を持つ", () => {
+    const sql = readFileSync(new URL("../../supabase/migrations/20261022000100_import_wallet_kind_check.sql", import.meta.url), "utf8");
+    const pairs = [...sql.matchAll(/when '([a-z_]+)' then '([a-z_]+)'/g)].map((m) => [m[1], m[2]]);
+    expect(pairs).toEqual(STATEMENT_CSV_FORMATS.map((f) => [f.id, f.walletKind]));
   });
 });
 

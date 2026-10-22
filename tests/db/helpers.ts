@@ -5,6 +5,8 @@ export const STAFF_ID = "00000000-0000-4000-8000-000000000002";
 export const CUSTOMER_A = "10000000-0000-4000-8000-000000000001";
 export const CUSTOMER_B = "10000000-0000-4000-8000-000000000002";
 export const WALLET_A = "20000000-0000-4000-8000-000000000001";
+/** サンプル商事のクレジットカードの口座（seed） */
+export const WALLET_A_CARD = "20000000-0000-4000-8000-000000000002";
 
 export async function connect(): Promise<Client> {
   const url = process.env.TEST_DATABASE_URL;

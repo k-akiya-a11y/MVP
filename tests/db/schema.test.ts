@@ -6,6 +6,7 @@ import {
   CUSTOMER_B,
   STAFF_ID,
   WALLET_A,
+  WALLET_A_CARD,
   asActor,
   connect,
   expectQueryError,
@@ -301,17 +302,83 @@ describe("明細の取込", () => {
     });
   });
 
+  it("CSV の形式と口座の種類が合わなければ、担当顧客の口座でも取り込まず、明細も取込記録も増えない", async () => {
+    const bankRows = rows;
+    const cardRows = [{ txn_date: "2026-10-05", amount: 550, direction: "expense", description: "ｻﾝﾌﾟﾙｺﾝﾋﾞﾆ", balance: null, dedupe_key: "c1" }];
+    await asActor(client, { role: "authenticated", userId: STAFF_ID }, async () => {
+      const count = async () => {
+        const res = await client.query<{ txns: string; imports: string }>(
+          "select (select count(*) from public.bank_transactions where customer_id = $1) as txns, (select count(*) from public.statement_imports where customer_id = $1) as imports",
+          [CUSTOMER_A],
+        );
+        return { txns: Number(res.rows[0]!.txns), imports: Number(res.rows[0]!.imports) };
+      };
+      const before = await count();
+
+      // 銀行 CSV をカードの口座へ
+      let message = await expectQueryError(
+        client,
+        "select * from public.import_bank_statement($1, $2, 'csv', 'bank.csv', 'bank_generic', $3, null, '[]')",
+        [CUSTOMER_A, WALLET_A_CARD, JSON.stringify(bankRows)],
+      );
+      expect(message).toMatch(/口座と CSV の形式が合っていません/);
+      // カード CSV を銀行の口座へ
+      message = await expectQueryError(
+        client,
+        "select * from public.import_bank_statement($1, $2, 'csv', 'card.csv', 'card_generic', $3, null, '[]')",
+        [CUSTOMER_A, WALLET_A, JSON.stringify(cardRows)],
+      );
+      expect(message).toMatch(/口座と CSV の形式が合っていません/);
+      // 未対応の形式
+      message = await expectQueryError(
+        client,
+        "select * from public.import_bank_statement($1, $2, 'csv', 'x.csv', 'unknown_format', $3, null, '[]')",
+        [CUSTOMER_A, WALLET_A, JSON.stringify(bankRows)],
+      );
+      expect(message).toMatch(/未対応の CSV 形式/);
+      // 別の顧客の口座 ID
+      message = await expectQueryError(
+        client,
+        "select * from public.import_bank_statement($1, $2, 'csv', 'x.csv', 'bank_generic', $3, null, '[]')",
+        [CUSTOMER_A, "20000000-0000-4000-8000-0000000000ff", JSON.stringify(bankRows)],
+      );
+      expect(message).toMatch(/口座が見つかりません/);
+
+      expect(await count()).toEqual(before);
+
+      // 合っていれば取り込める（検査が厳しすぎないこと）
+      const ok = await client.query(
+        "select * from public.import_bank_statement($1, $2, 'csv', 'card.csv', 'card_generic', $3, null, '[]')",
+        [CUSTOMER_A, WALLET_A_CARD, JSON.stringify(cardRows)],
+      );
+      expect(ok.rows[0]).toMatchObject({ inserted_count: 1 });
+    });
+  });
+
+  it("形式が合わなかった取込を「失敗」として記録することはできる（明細は登録しない）", async () => {
+    await asActor(client, { role: "authenticated", userId: STAFF_ID }, async () => {
+      const id = await client.query<{ record_failed_statement_import: string }>(
+        "select public.record_failed_statement_import($1, $2, 'csv', 'bank.csv', 'bank_generic', 5, $3)",
+        [CUSTOMER_A, WALLET_A_CARD, JSON.stringify([{ line: 0, message: "選んだ口座と CSV の形式が合っていません" }])],
+      );
+      const rec = await client.query("select status, row_count, inserted_count from public.statement_imports where id = $1", [
+        id.rows[0]!.record_failed_statement_import,
+      ]);
+      expect(rec.rows).toEqual([{ status: "failed", row_count: 0, inserted_count: 0 }]);
+    });
+  });
+
   it("残高がなく区別できない行は捨てず「重複の疑い」として登録する", async () => {
     const card = [{ txn_date: "2026-10-05", amount: 550, direction: "expense", description: "ｻﾝﾌﾟﾙｺﾝﾋﾞﾆ", balance: null, dedupe_key: "c1" }];
     await asActor(client, { role: "authenticated", userId: STAFF_ID }, async () => {
       const first = await client.query(
         "select * from public.import_bank_statement($1, $2, 'csv', 'a.csv', 'card_generic', $3, null, '[]')",
-        [CUSTOMER_A, WALLET_A, JSON.stringify(card)],
+        [CUSTOMER_A, WALLET_A_CARD, JSON.stringify(card)],
       );
       expect(first.rows[0]).toMatchObject({ inserted_count: 1, skipped_duplicate_count: 0, suspected_duplicate_count: 0 });
       const second = await client.query(
         "select * from public.import_bank_statement($1, $2, 'csv', 'b.csv', 'card_generic', $3, null, '[]')",
-        [CUSTOMER_A, WALLET_A, JSON.stringify(card)],
+        [CUSTOMER_A, WALLET_A_CARD, JSON.stringify(card)],
       );
       expect(second.rows[0]).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 0, suspected_duplicate_count: 1 });
 
@@ -446,7 +513,7 @@ describe("重複の疑いの確認（resolve_suspected_duplicate）", () => {
     await client.query("set local role authenticated");
     for (const file of ["a.csv", "b.csv"]) {
       await client.query("select * from public.import_bank_statement($1, $2, 'csv', $3, 'card_generic', $4, null, '[]')", [
-        CUSTOMER_A, WALLET_A, file, JSON.stringify(card),
+        CUSTOMER_A, WALLET_A_CARD, file, JSON.stringify(card),
       ]);
     }
     await client.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
