@@ -14,7 +14,7 @@
 | A. `vercel.json` の `git.deploymentEnabled.main = false` | main へのコミット（マージ）を引金にした**自動**デプロイ。main のデプロイ自体が作られない | 他ブランチの Preview デプロイ、ダッシュボードの Redeploy / Promote、Vercel CLI（`vercel --prod`）、Deploy Hook による手動デプロイ、すでに公開中のデプロイ |
 | D. ダッシュボードの Cron Jobs → Disable Cron Jobs        | 本番デプロイでの Cron の定期実行（再デプロイ・ロールバックをまたいで無効のまま）         | デプロイそのもの、`/api/cron/propose` を手で呼ぶこと（`CRON_SECRET` が合えば動く）、既存の公開                                                            |
 
-A と D はどちらも「既存の公開や手動の操作まで止めるもの」ではありません。本番が一度も出ていない今の状態を保ちつつ、main への統合だけを進めるための措置です。
+A と D はどちらも「既存の公開や手動の操作まで止めるもの」ではありません。機能①の本番利用は未承認のまま、main への統合だけを進めるための措置です。
 
 ## 保留の手順
 
@@ -28,7 +28,17 @@ A と D はどちらも「既存の公開や手動の操作まで止めるもの
    - この設定は、マージ後の main にある `vercel.json` で評価される。
 
 2. **案 D（ダッシュボード、Ken）**: Vercel → mvp → Settings → Cron Jobs →「Disable Cron Jobs」。無効のままでも cron は一覧に残る。
-3. **マージ後の確認**: Vercel → mvp → Deployments に、そのマージコミットの Production デプロイが**作られていない**ことを確認する（作られていれば案 A が効いていないので、Ignored Build Step「Only build preview」に切り替えて止める）。
+3. **マージ後の確認**: Vercel → mvp → Deployments に、そのマージコミットの Production デプロイが**作られていない**ことを確認する。作られていた場合は、次の「想定外の Production デプロイが作られた場合」に従う。
+
+## 想定外の Production デプロイが作られた場合
+
+案 A が効いていない、または手動操作で Production デプロイができてしまった場合の手順。止める操作と、今後のビルドを抑える操作を分けて行う。
+
+1. **確認**: Deployments でそのデプロイを開き、対象コミット（SHA とブランチ）、環境が Production であること、状態（Building / Ready / Error / Canceled）を確認して記録する。
+2. **ビルド中なら中止**: 状態が Building（Queued を含む）なら、そのデプロイの画面で「Cancel Deployment」を選び、状態が Canceled になることを確認する。中止したデプロイは公開されない。
+3. **公開済みなら公開停止（Ken）**: 状態が Ready で本番として公開されているなら、Ken が Vercel → mvp → Settings → General の「Pause Project」で公開を止める（プロジェクト名を入力して確定。Owner / Member か Project Administrator の権限が要る）。停止中は本番 URL へのアクセスが 503（DEPLOYMENT_PAUSED）になる。再開は同じ場所の「Resume Project」で、再デプロイは不要（[公式の停止手順](https://vercel.com/docs/projects/managing-projects#pause-a-project-from-the-dashboard)）。
+4. **今後のビルド抑止（別の操作）**: 公開停止とは別に、Settings → Build and Deployment → Ignored Build Step を「Only build preview」にして、main 側のビルドを作らせない。これは Production デプロイを CANCELED として記録するだけで、すでに公開中のデプロイは止めない（止めるのは手順 3）。あわせて `vercel.json` の案 A の設定が main に入っているかを確認する。
+5. **記録**: 対象コミット、状態、行った操作、誰が、いつを下の「記録」に残す。
 
 ## 解除（本番公開）の手順
 
@@ -36,7 +46,7 @@ A と D はどちらも「既存の公開や手動の操作まで止めるもの
 
 1. Settings → Deployment Protection で、本番に掛けるアクセス保護（Vercel Authentication の対象）を決めて確認する。
 2. Settings → Environment Variables で、Production に必要な変数（名前と適用先）が揃っていることを確認する。値は共有しない。`CRON_SECRET` が無いと Cron は 401 で止まる。
-3. `vercel.json` から `git.deploymentEnabled` の行を外すコミットを main に入れる。**このコミットが最初の本番デプロイの引金になる。**
+3. `vercel.json` から `git.deploymentEnabled` の行を外すコミットを main に入れる。**このコミットが、機能①を含む本番デプロイの引金になる。**
 4. Deployments で Production デプロイが Ready になり、アクセス保護が効いていることを確認する。
 5. Cron の再有効化（Settings → Cron Jobs → Enable）は、本番で定期処理を動かす判断として**別に**決める。
 
@@ -53,5 +63,7 @@ A と D はどちらも「既存の公開や手動の操作まで止めるもの
 - [Git Configuration: git.deploymentEnabled](https://vercel.com/docs/project-configuration/git-configuration)
 - [Can you deploy based on tags/releases on Vercel?](https://vercel.com/kb/guide/can-you-deploy-based-on-tags-releases-on-vercel)
 - [Project settings: Ignored Build Step](https://vercel.com/docs/project-configuration/project-settings)
+- [Managing projects: Pause a project from the dashboard](https://vercel.com/docs/projects/managing-projects#pause-a-project-from-the-dashboard)
+- [Managing deployments](https://vercel.com/docs/deployments/managing-deployments)
 - [Managing Cron Jobs: Disabling Cron Jobs](https://vercel.com/docs/cron-jobs/manage-cron-jobs)
 - [Vercel Authentication](https://vercel.com/docs/deployment-protection/methods-to-protect-deployments/vercel-authentication)
