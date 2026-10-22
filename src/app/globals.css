@@ -1,0 +1,50 @@
+:root {
+  --fg: #1f2328;
+  --muted: #59636e;
+  --line: #d1d9e0;
+  --accent: #0969da;
+  --bg: #ffffff;
+  --row: #f6f8fa;
+  --danger: #cf222e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --line: #3d444d;
+    --accent: #4493f8;
+    --bg: #0d1117;
+    --row: #151b23;
+    --danger: #f85149;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif; color: var(--fg); background: var(--bg); font-size: 14px; }
+main { padding: 16px 24px; max-width: 1400px; margin: 0 auto; }
+main.narrow { max-width: 480px; padding-top: 80px; }
+a { color: var(--accent); }
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.income { color: var(--accent); }
+.error { color: var(--danger); }
+.note { color: var(--muted); }
+button { font: inherit; padding: 4px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--row); color: var(--fg); cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: default; }
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; margin: 16px 0 4px; }
+.tabs .active { border-color: var(--accent); color: var(--accent); }
+.upload { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 8px; border: 1px solid var(--line); border-radius: 6px; }
+.board { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 900px) { .board { grid-template-columns: 1fr; } }
+.list tr { cursor: pointer; }
+.list tr.current { background: var(--row); outline: 2px solid var(--accent); }
+.detail { border: 1px solid var(--line); border-radius: 6px; padding: 12px 16px; position: sticky; top: 8px; align-self: start; }
+.detail h2 { font-size: 16px; margin: 0 0 4px; }
+.detail h3 { font-size: 14px; margin: 16px 0 4px; }
+.entry { display: grid; grid-template-columns: 6em 1fr; gap: 2px 8px; margin: 0; }
+.entry dt { color: var(--muted); }
+.entry dd { margin: 0; }
+.actions { display: flex; gap: 8px; margin-top: 12px; }
+.editor { display: grid; gap: 8px; }
+.editor label { display: grid; grid-template-columns: 7em 1fr; align-items: center; gap: 8px; }
+.editor select, .editor input { font: inherit; padding: 4px; }

@@ -7,6 +7,7 @@
 - 開発ルール（Claude Code / Codex 共通）: [CLAUDE.md](CLAUDE.md) ＝ [AGENTS.md](AGENTS.md)
 - 共有開発ルール（役割・変更・検証・復旧）: [docs/development-rules.md](docs/development-rules.md)
 - 完成チェックリスト（実装完了・検証完了・リリース承認）: [docs/completion-checklist.md](docs/completion-checklist.md)
+- 本番公開の保留と解除の手順（Vercel）: [docs/deployment-hold.md](docs/deployment-hold.md)
 
 ## MVPの機能
 
@@ -31,4 +32,4 @@ Next.js（TypeScript, Vercel）／Supabase（Postgres, 東京リージョン）�
 
 ## 状態
 
-現在は初期構成（ドキュメントとディレクトリの骨組み）のみです。アプリの初期化と機能実装はこれからです。セットアップ手順と実行方法は、アプリ作成後に [CLAUDE.md](CLAUDE.md) の「実行・テスト方法」に追記します。
+機能①（銀行・カード明細 → 仕訳候補）を実装中です。セットアップ手順と実行方法は [CLAUDE.md](CLAUDE.md) の「実行・テスト方法」を参照してください。

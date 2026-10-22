@@ -1,0 +1,6 @@
+{
+  "framework": "nextjs",
+  "regions": ["hnd1"],
+  "git": { "deploymentEnabled": { "main": false } },
+  "crons": [{ "path": "/api/cron/propose", "schedule": "0 22 * * *" }]
+}

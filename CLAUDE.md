@@ -46,8 +46,12 @@ MVPの機能（優先順位）:
 │   └── lib/
 │       ├── ai/             Claude API 呼出し、プロンプト（版管理）、出力 JSON の検証
 │       ├── confidence/     確信度計算（4つの証拠からプログラムで計算）
+│       ├── review/         承認画面のデータ読込と、人の確認の記録（record_human_review）
+│       ├── proposals/      明細1件の仕訳候補づくり（ルール照合 → 過去仕訳検索 → AI → 確信度）と判定ジョブ
+│       ├── statements/     明細CSVの読取と取込（銀行・カード会社ごとの形式、重複キー）
 │       ├── rules/          顧客別ルールの照合（構造化ルール、文章メモの取得）
 │       ├── retrieval/      過去仕訳の検索（取引先キーの正規化、類似度）
+│       ├── supabase/       Supabase クライアント（担当者の権限で接続するものと、サーバー専用のもの）
 │       ├── freee/          freee API クライアント（読取、トークン管理）
 │       ├── google/         Gmail（下書き作成のみ）、Drive クライアント
 │       ├── audit/          AI判断ログ・人の確認ログ（追記専用）
@@ -125,20 +129,19 @@ MVPの機能（優先順位）:
 
 ## 9. 実行・テスト方法
 
-> アプリはまだ作成していません（このリポジトリは初期構成のみ）。Next.js の初期化後、ここに実際のコマンドを追記してください。
-
-予定しているコマンド（Next.js 初期化後に確定）:
-
 ```bash
-npm install          # 依存関係のインストール
+npm install                  # 依存関係のインストール（Node.js 22 以上）
 cp .env.example .env.local   # 環境変数を設定（値は各自で入力）
-npm run dev          # 開発サーバー
-npm run lint         # Lint
-npm run typecheck    # 型チェック
-npm test             # ユニットテスト
-npx supabase start   # ローカル Supabase（Docker が必要）
-npx supabase db reset  # マイグレーションと seed を適用
+npm run dev                  # 開発サーバー
+npm run lint                 # Lint
+npm run typecheck            # 型チェック
+npm test                     # ユニットテスト（外部 API はモック）
+npm run db:test:local        # マイグレーション・RLS のテスト（Docker 不要。ローカルの Postgres 16 を一時起動）
+npx supabase start           # ローカル Supabase（Docker が必要）
+npx supabase db reset        # マイグレーションと seed（supabase/seed/*.sql）を適用
 ```
+
+- DB テストは `TEST_DATABASE_URL` の Postgres に `npm run db:apply`（Supabase 互換の土台 `tests/db/supabase-shim.sql` → マイグレーション → seed）を適用してから `npm run test:db` で流します。CI（`.github/workflows/ci.yml`）も同じ手順です。
 
 変更を出す前に、lint・型チェック・テストがすべて通ることを確認してください。
 
