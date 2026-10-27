@@ -20,6 +20,13 @@ export default async function CustomerReviewPage({ params }: { params: Promise<{
         <Link href="/">← 顧客一覧</Link>
       </p>
       <h1>{queue.customer.name}</h1>
+      <p>
+        <Link href={`/customers/${customerId}/past-quality`}>過去仕訳の科目の揺れを確認する</Link>
+        {" / "}
+        <Link href={`/customers/${customerId}/rules`}>顧客ルールを確認・編集する</Link>
+        {" / "}
+        <Link href={`/customers/${customerId}/notes`}>文章メモを確認・編集する</Link>
+      </p>
       <UploadForm
         customerId={customerId}
         wallets={queue.wallets}

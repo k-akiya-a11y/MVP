@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { parseCsvWithLines } from "./csv";
+import { CsvSyntaxError, parseCsvWithLines, type CsvRow } from "./csv";
 import type { StatementCsvFormat } from "./formats";
 import { parseStatementDate, parseYen } from "./values";
 
@@ -24,14 +24,18 @@ export type StatementParseResult = {
   rows: ParsedStatementRow[];
   errors: StatementParseError[];
   ignored: StatementIgnoredRow[];
-  /** 見出し行より後の行数（空行を除く）。= rows + ignored + errors（照合に使う） */
-  sourceRowCount: number;
+  /**
+   * 見出し行より後の行数（空行を除く）。= rows + ignored + errors（照合に使う）。
+   * CSV の形式が壊れていて行を数えられないときは null（取込記録には行数なしの失敗として残す）
+   */
+  sourceRowCount: number | null;
 };
 
 export function decodeStatement(bytes: Uint8Array, encoding: StatementCsvFormat["encoding"]): string {
   // UTF-8 の BOM があれば形式の指定より優先する（ネットバンキングによっては UTF-8 で出す）
   if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
-    return new TextDecoder("utf-8").decode(bytes.subarray(3));
+    // 不正なバイトを U+FFFD に置き換えると摘要が変わり、照合・重複判定が狂うため、BOM 後も fatal で読む
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(3));
   }
   return new TextDecoder(encoding, { fatal: true }).decode(bytes);
 }
@@ -69,11 +73,26 @@ function locateHeader(table: string[][], format: StatementCsvFormat) {
 }
 
 /**
- * 明細 CSV を読み、取引の行に変換する。読めない行は errors に入れ、取込全体は止めない。
+ * 明細 CSV を読み、取引の行に変換する。読めない行は errors に入れる（取込側は1行でもあればファイル全体を取り込まない）。
  * 金額0の行（残高照会の行など）は取引にせず、ignored に行番号と理由を残す。
+ * CSV の書式そのものが壊れているとき（クオートが閉じていない等）は、どこまでが1行か判断できないので、
+ * 行を1件も返さず、誤りの行番号だけを errors に入れる。
  */
 export function parseStatementCsv(text: string, format: StatementCsvFormat): StatementParseResult {
-  const csvRows = parseCsvWithLines(text);
+  let csvRows: CsvRow[];
+  try {
+    csvRows = parseCsvWithLines(text);
+  } catch (error) {
+    if (error instanceof CsvSyntaxError) {
+      return {
+        rows: [],
+        errors: [{ line: error.line, message: `CSV の書式が正しくありません: ${error.message}` }],
+        ignored: [],
+        sourceRowCount: null,
+      };
+    }
+    throw error;
+  }
   const table = csvRows.map((r) => r.cells);
   const header = locateHeader(table, format);
   if (!header) {
@@ -98,11 +117,22 @@ export function parseStatementCsv(text: string, format: StatementCsvFormat): Sta
   const errors: StatementParseError[] = [];
   const ignored: StatementIgnoredRow[] = [];
   const cell = (r: string[], idx: number) => (idx >= 0 ? (r[idx] ?? "") : "");
+  // 行の形（列数）の検査に使う。使う列がすべて行にあること、見出しより右に値がないこと
+  const headerWidth = table[header.headerIndex]!.length;
+  const requiredWidth = Math.max(header.date, header.description, header.withdrawal, header.deposit, header.signedAmount, header.balance) + 1;
 
   for (let i = header.headerIndex + 1; i < table.length; i++) {
     const r = table[i]!;
     const line = csvRows[i]!.line;
     try {
+      // 値の解釈（金額0の扱いを含む）より先に、行の形を確かめる。途中で切れた行の欠けた列を
+      // 空欄 = 金額0として読み飛ばしたり、摘要のカンマで右にずれた列を取り込んだりしないため
+      if (r.length < requiredWidth) {
+        throw new Error(`列が足りません（${r.length}列、必要なのは${requiredWidth}列以上。行が途中で切れている可能性があります）`);
+      }
+      if (r.slice(headerWidth).some((c) => c.trim() !== "")) {
+        throw new Error(`見出しより右に値があります（${r.length}列、見出しは${headerWidth}列。クオートされていないカンマの可能性があります）`);
+      }
       const txnDate = parseStatementDate(cell(r, header.date));
       const description = cell(r, header.description).trim();
       let signed: number; // 正 = 出金
@@ -148,9 +178,10 @@ function countDataRows(table: string[][], from: number): number {
  * 複数あるときは出現順の連番で区別する（同日に同額のコンビニ払いが2回、など）。
  * 期間が重なる CSV を取り込み直しても、同じ取引は同じキーになる。
  *
- * 残高がある行は残高まで一致して初めて同じキーになるので、取込済みなら読み飛ばしてよい。
- * 残高がない行（カード明細など）は、別の CSV に入った同日・同額・同摘要の別取引と区別できないため、
- * DB 側（import_bank_statement）で捨てずに「重複の疑い」として人の確認に回す。
+ * 連番はファイルごとに数え直すので、別のファイルにある別の取引（同日・同額・同摘要・同残高）が同じキーになりうる。
+ * キーが同じことは同一取引の証明ではない。取込済みと同じキーの行を読み飛ばすかどうかは DB 側
+ * （import_bank_statement）が決める。取込全体が同じ内容の再実行だと DB が確かめられた残高のある行だけを読み飛ばし、
+ * それ以外はすべて捨てずに「重複の疑い」として人の確認に回す。
  */
 export function buildDedupeKeys(walletId: string, rows: readonly ParsedStatementRow[]): string[] {
   const seen = new Map<string, number>();

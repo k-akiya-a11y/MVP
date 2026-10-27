@@ -10,6 +10,9 @@ export default defineConfig({
     projects: [
       {
         resolve: { alias },
+        // tsconfig は Next 用に jsx: preserve のため、Vite の変換にそのまま渡すと
+        // ページを import するテストが import analysis で失敗する。unit だけ automatic runtime で変換する
+        oxc: { jsx: { runtime: "automatic" } },
         test: {
           name: "unit",
           include: ["tests/unit/**/*.test.ts"],
