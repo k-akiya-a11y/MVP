@@ -183,14 +183,17 @@ describe("proposeForTransaction", () => {
     expect(draft.ai.unknowns[0]).toMatch(/refused/);
   });
 
-  it("AI に送る摘要は口座番号を伏せ、外部データとして囲む", async () => {
+  it("AI に送る摘要は口座番号を伏せ、user の参考データ JSON の中に置く（system には入れない）", async () => {
     const ai = mockAi();
     await proposeForTransaction(sampleContext(), txn({ description: "ｶ)ｻﾝﾌﾟﾙﾌﾄﾞｳｻﾝ 1234567" }), ai);
     const prompt = ai.mock.calls[0]![0] as Parameters<JournalAi>[0];
     const user = JSON.stringify(prompt.messages);
     expect(user).not.toContain("1234567");
-    expect(user).toContain("<bank_description>");
-    expect(prompt.system.at(-1)?.cache_control).toEqual({ type: "ephemeral" });
+    const sent = JSON.parse(prompt.messages[0]!.content as string);
+    expect(sent.transaction.description).toBe("ｶ)ｻﾝﾌﾟﾙﾌﾄﾞｳｻﾝ *******");
+    expect(JSON.stringify(prompt.system)).not.toContain("ｻﾝﾌﾟﾙﾌﾄﾞｳｻﾝ");
+    // 顧客データを system に置かないので、system にキャッシュ指定は付けない
+    expect(prompt.system.some((b) => "cache_control" in b)).toBe(false);
   });
 });
 

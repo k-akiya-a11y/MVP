@@ -30,6 +30,11 @@ export function DuplicatesPanel({
     try {
       const result = await resolveDuplicateAction(customerId, { bankTransactionId: id, resolution, reason: null });
       if (!result.ok) setMessage(result.error);
+    } catch {
+      // 結果を受け取れなかった。判断はすでに記録されている可能性があるので、成否を断定しない
+      setMessage(
+        "操作の結果を確認できませんでした。この明細の判断はすでに記録されている可能性があります。画面を再読み込みして、取引の状態と履歴を確認してから、必要な場合だけもう一度操作してください。",
+      );
     } finally {
       setBusy(false);
     }
@@ -39,7 +44,7 @@ export function DuplicatesPanel({
     <section>
       <h2>重複の疑い（{items.length}）</h2>
       <p className="note">
-        取込済みの明細と日付・金額・摘要が同じで、残高がないため同じ取引か区別できなかった明細です。通帳やカードの利用明細で確かめてください。
+        取込済みの明細と日付・金額・摘要が同じで、取り込んだデータだけでは同じ取引だと確定できなかった明細です（残高がない場合や、残高が同じでも一部だけ重なっている場合を含みます）。残高が同じでも別の取引とは限りません。元の通帳やカードの利用明細で確かめてください。
       </p>
       {message && <p className="error">{message}</p>}
       <table className="list">

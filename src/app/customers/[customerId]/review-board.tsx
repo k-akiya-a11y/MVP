@@ -15,6 +15,12 @@ const TABS: { id: Tab; label: string }[] = [
 ];
 const CONFIDENCE_LABEL = { high: "高", medium: "中", low: "低" } as const;
 
+// サーバー処理の応答を受け取れなかったときの表示。記録済みかどうかは分からないので、再読み込みして確認してもらう
+const REVIEW_UNKNOWN_MESSAGE =
+  "操作の結果を確認できませんでした。この明細の確認はすでに記録されている可能性があります。画面を再読み込みして、取引の状態と確認の履歴を確認してから、必要な場合だけもう一度操作してください。";
+const BULK_UNKNOWN_MESSAGE =
+  "まとめて承認の結果を確認できませんでした。選択した明細の一部またはすべてがすでに承認されている可能性があります。選択は解除しました。画面を再読み込みして、取引の状態と確認の履歴を確認してから、必要な明細だけもう一度選んでください。";
+
 const yen = (n: number) => n.toLocaleString("ja-JP");
 const secondsSince = (t: number) => Math.max(0, Math.round((Date.now() - t) / 1000));
 
@@ -121,6 +127,9 @@ export function ReviewBoard({
           bulk: false,
         });
         setMessage(result.ok ? null : result.error);
+      } catch {
+        // 通信の失敗などで結果を受け取れなかった。確認の記録は済んでいるかもしれないので、成否を断定しない
+        setMessage(REVIEW_UNKNOWN_MESSAGE);
       } finally {
         setBusy(false);
       }
@@ -131,6 +140,7 @@ export function ReviewBoard({
   const bulkApprove = useCallback(async () => {
     if (!canApprove || bulkTargets.length === 0 || busy) return;
     setBusy(true);
+    setMessage(null);
     try {
       // まとめて承認は一覧を見ていた時間を件数で割って1件あたりの秒数にする
       const perItem = Math.round(secondsSince(tabShownAt.current) / bulkTargets.length);
@@ -145,6 +155,11 @@ export function ReviewBoard({
           ? `${result.approved}件を承認、${result.failures.length}件は承認できませんでした: ${result.failures[0]?.error}`
           : `${result.approved}件を承認しました`,
       );
+    } catch {
+      // 結果を受け取れなかった。一部またはすべてが承認済みかもしれないので、同じ選択をそのまま送り直さないよう選択を外す
+      setSelected(new Set());
+      tabShownAt.current = Date.now();
+      setMessage(BULK_UNKNOWN_MESSAGE);
     } finally {
       setBusy(false);
     }

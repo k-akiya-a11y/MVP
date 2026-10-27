@@ -4,32 +4,54 @@ on:
   pull_request:
   push:
     branches: [main]
+  # 手動実行（ブランチを選んで同じ検証を流す）。秘密情報・入力は使わない
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# 同じ PR / ブランチの古い実行は、新しいコミットで取り消す（push 先の main は取り消さない）
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    # 明示の bash は -eo pipefail で動く。パイプを使う手順でも失敗が隠れない
+    # キャッシュ・アーティファクトは使わない（標準ランナーの通常ログのみ）
+    shell: bash
+
 jobs:
   check:
     name: lint・型チェック・ユニットテスト
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci
+      - name: 版の記録（通常のログのみ・環境変数は出力しない）
+        run: |
+          echo "commit: $(git rev-parse HEAD)"
+          echo "node: $(node --version)"
+          echo "npm: $(npm --version)"
+          echo "os: $(uname -sr)"
+      - run: npm ci --ignore-scripts
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm test
+      - name: ユニットテスト
+        run: npm test
       - run: npm run build
 
   db:
-    name: マイグレーション・RLS テスト
-    runs-on: ubuntu-latest
+    name: マイグレーション・RLS・アップグレード・並行テスト
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     services:
       postgres:
-        image: postgres:16
+        # マイナーバージョンまで固定する（下の「Postgres の版を確認」で実際の版も検査する）
+        image: postgres:16.15
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -40,13 +62,33 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      # CI の使い捨てサービスコンテナ（localhost）専用の値。実在の環境には接続しない
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
+        with:
+          # アップグレードテストが固定のベースラインのコミットを git から読むため、全履歴を取得する
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run db:apply
-      - run: npm run test:db
+      - name: 版の記録（通常のログのみ・環境変数は出力しない）
+        run: |
+          echo "commit: $(git rev-parse HEAD)"
+          echo "node: $(node --version)"
+          echo "npm: $(npm --version)"
+          echo "psql: $(psql --version)"
+          echo "os: $(uname -sr)"
+          echo "postgres server: $(psql "$TEST_DATABASE_URL" -Atc 'show server_version')"
+      - name: Postgres の版を確認
+        run: |
+          version="$(psql "$TEST_DATABASE_URL" -Atc 'show server_version' | cut -d' ' -f1)"
+          if [ "$version" != "16.15" ]; then
+            echo "expected Postgres 16.15 but got $version" >&2
+            exit 1
+          fi
+      - run: npm ci --ignore-scripts
+      - name: 土台・マイグレーション・seed の適用（空の DB から）
+        run: npm run db:apply
+      - name: DB テスト（RLS・アップグレード・並行）
+        run: npm run test:db

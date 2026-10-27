@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-import type { ImportCounts } from "@/lib/statements/import";
+import { submitStatementUpload, UPLOAD_UNKNOWN_MESSAGE } from "@/lib/statements/upload-result";
 
 type Props = {
   customerId: string;
@@ -21,22 +21,17 @@ export function UploadForm({ customerId, wallets, formats }: Props) {
     setBusy(true);
     setMessage(null);
     try {
-      const res = await fetch(`/api/customers/${customerId}/statements`, {
-        method: "POST",
-        body: new FormData(event.currentTarget),
-      });
-      const body = (await res.json()) as
-        | ({ ok: true } & ImportCounts)
-        | { ok: false; errors: { line: number; message: string }[]; failureRecordId: string | null }
-        | { error: string };
-      if ("error" in body) setMessage(body.error);
-      else if (body.ok) setMessage(importSummary(body));
-      else
-        setMessage(
-          `取り込めませんでした（明細は1件も登録していません${body.failureRecordId ? "。失敗として記録しました" : ""}）: ` +
-            body.errors.slice(0, 5).map((e) => `${e.line}行目 ${e.message}`).join(" / "),
-        );
+      // 送信は1回だけ。通信や応答の異常でも自動では再送せず、結果不明として確認を促す
+      const outcome = await submitStatementUpload(
+        fetch,
+        `/api/customers/${customerId}/statements`,
+        new FormData(event.currentTarget),
+      );
+      setMessage(outcome.message);
       router.refresh();
+    } catch {
+      // フォーム読取などの想定外の例外。登録済みかもしれないので結果不明として扱う
+      setMessage(UPLOAD_UNKNOWN_MESSAGE);
     } finally {
       setBusy(false);
     }
@@ -73,20 +68,4 @@ export function UploadForm({ customerId, wallets, formats }: Props) {
       {message && <span className="note">{message}</span>}
     </form>
   );
-}
-
-const yen = (n: number) => n.toLocaleString("ja-JP");
-
-/** 取込結果の件数と金額。読めた行 = 登録 + 読み飛ばし + 重複の疑い で照合できるように並べる */
-function importSummary(c: ImportCounts): string {
-  const lines = [
-    `読めた行 ${c.insertedCount + c.skippedDuplicateCount + c.suspectedDuplicateCount}件（入金 ${yen(c.incomeTotal)}円・出金 ${yen(c.expenseTotal)}円）`,
-    `登録 ${c.insertedCount}件 ${yen(c.insertedAmountTotal)}円`,
-    `取込済みのため読み飛ばし ${c.skippedDuplicateCount}件 ${yen(c.skippedAmountTotal)}円`,
-  ];
-  if (c.suspectedDuplicateCount) {
-    lines.push(`重複の疑い ${c.suspectedDuplicateCount}件 ${yen(c.suspectedAmountTotal)}円（「重複の疑い」で確認してください）`);
-  }
-  if (c.ignoredCount) lines.push(`金額0のため取引にしなかった行 ${c.ignoredCount}件`);
-  return lines.join(" ／ ");
 }

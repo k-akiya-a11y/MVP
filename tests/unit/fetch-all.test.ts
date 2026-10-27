@@ -30,4 +30,38 @@ describe("fetchAll", () => {
       .mockResolvedValueOnce({ data: null, error: { message: "timeout" } });
     await expect(fetchAll("過去仕訳", page)).rejects.toThrow(/過去仕訳の読込に失敗しました: timeout/);
   });
+
+  it("1ページ目が data: null（error もなし）なら空として扱わず、エラーにする", async () => {
+    const page = vi.fn().mockResolvedValueOnce({ data: null, error: null });
+    await expect(fetchAll("過去仕訳", page)).rejects.toThrow(/過去仕訳の読込に失敗しました/);
+  });
+
+  it("2ページ目が data: null なら、1ページ目の行を成功として返さずエラーにする", async () => {
+    const page = vi
+      .fn()
+      .mockResolvedValueOnce({ data: [{ id: "synthetic-1" }], error: null })
+      .mockResolvedValueOnce({ data: null, error: null });
+    await expect(fetchAll("過去仕訳", page)).rejects.toThrow(/過去仕訳の読込に失敗しました/);
+  });
+
+  it.each([
+    ["undefined", undefined],
+    ["オブジェクト", { length: 0 } as unknown],
+    ["配列に似たオブジェクト", { length: 1, 0: { id: 1 } } as unknown],
+    ["文字列", "abc" as unknown],
+  ])("data が配列でない応答（%s）はエラーにし、途中までの行を返さない", async (_label, bad) => {
+    const page = vi
+      .fn()
+      .mockResolvedValueOnce({ data: [{ id: "synthetic-1" }], error: null })
+      .mockResolvedValueOnce({ data: bad, error: null });
+    await expect(fetchAll("過去仕訳", page)).rejects.toThrow(/過去仕訳の読込に失敗しました/);
+  });
+
+  it("空の配列は正常な終端で、それまでに読んだ行を返す", async () => {
+    const page = vi
+      .fn()
+      .mockResolvedValueOnce({ data: [{ id: 1 }], error: null })
+      .mockResolvedValueOnce({ data: [], error: null });
+    await expect(fetchAll("過去仕訳", page)).resolves.toEqual([{ id: 1 }]);
+  });
 });

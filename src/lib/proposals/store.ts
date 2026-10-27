@@ -250,7 +250,16 @@ export function supabaseProposalStore(client: SupabaseClient): ProposalStore {
 }
 
 /** 過去仕訳は直近24か月分を使う（設計書3章） */
-function shiftYears(date: string, years: number): string {
+export function shiftYears(date: string, years: number): string {
   const [y, m, d] = date.split("-");
-  return `${Number(y) + years}-${m}-${d}`;
+  const month = Number(m);
+  const year = Number(y) + years;
+  // 暦の年単位でずらす。移動先に同じ日がない（うるう日 → 平年）ときは、その月の末日に丸める
+  const day = Math.min(Number(d), daysInMonth(year, month));
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }

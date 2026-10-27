@@ -394,7 +394,7 @@ describe("明細の取込", () => {
     });
   });
 
-  it("取込記録で、読めた行の件数・金額 = 登録 + 読み飛ばし + 重複の疑い が成り立つ", async () => {
+  it("取込記録で、読めた行の件数・金額 = 登録 + 読み飛ばし + 重複の疑い が成り立つ（一部だけ重なる取込）", async () => {
     const mixed = [
       { txn_date: "2026-10-27", amount: 9020, direction: "expense", description: "ｻﾝﾌﾟﾙﾂｳｼﾝ(ｶ", balance: 100000, dedupe_key: "m1" },
       { txn_date: "2026-10-05", amount: 550, direction: "expense", description: "ｻﾝﾌﾟﾙｺﾝﾋﾞﾆ", balance: null, dedupe_key: "m2" },
@@ -411,10 +411,11 @@ describe("明細の取込", () => {
       const res = await client.query("select * from public.import_bank_statement($1, $2, 'csv', 'm2.csv', 'bank_generic', $3, 4, $4)", [
         CUSTOMER_A, WALLET_A, JSON.stringify(second), ignored,
       ]);
+      // 一部だけ重なる取込は再実行ではないので、残高のある行も読み飛ばさず「重複の疑い」にする
       expect(res.rows[0]).toMatchObject({
-        inserted_count: 1, skipped_duplicate_count: 1, suspected_duplicate_count: 1,
+        inserted_count: 1, skipped_duplicate_count: 0, suspected_duplicate_count: 2,
         income_total: "330000", expense_total: "9570",
-        inserted_amount_total: "330000", skipped_amount_total: "9020", suspected_amount_total: "550",
+        inserted_amount_total: "330000", skipped_amount_total: "0", suspected_amount_total: "9570",
       });
       const rec = await client.query(
         "select status, source_row_count, row_count, inserted_count, ignored_rows from public.statement_imports where file_name = 'm2.csv'",
@@ -471,6 +472,170 @@ describe("明細の取込", () => {
       await client.query("rollback");
     }
   });
+});
+
+describe("明細の取込: 別ファイルのキーの重なり（取込全体の再実行だけを読み飛ばす）", () => {
+  const shop = { txn_date: "2026-10-05", amount: 1000, direction: "expense", description: "ｻﾝﾌﾟﾙｼﾖﾂﾌﾟ", balance: 9000 };
+  const salary = { txn_date: "2026-10-05", amount: 1000, direction: "income", description: "ﾃｽﾄﾆﾕｳｷﾝ", balance: 10000 };
+  const csvA = [{ ...shop, dedupe_key: "x-shop-1" }];
+  // CSV B の連番は 1 から数え直すので、別の取引である同じ内容の出金が CSV A と同じキーになる
+  const csvB = [{ ...salary, dedupe_key: "x-salary-1" }, { ...shop, dedupe_key: "x-shop-1" }];
+
+  const importRows = (file: string, rowsToImport: object[], count: number | null = null) =>
+    client.query(
+      "select * from public.import_bank_statement($1, $2, 'csv', $3, 'bank_generic', $4, $5, '[]')",
+      [CUSTOMER_A, WALLET_A, file, JSON.stringify(rowsToImport), count],
+    );
+  const txnCount = async () =>
+    Number((await client.query<{ n: string }>("select count(*) as n from public.bank_transactions where customer_id = $1", [CUSTOMER_A])).rows[0]!.n);
+
+  async function inTx(fn: () => Promise<void>) {
+    await client.query("begin");
+    try {
+      await fn();
+    } finally {
+      await client.query("rollback");
+    }
+  }
+  const asStaff = async () => {
+    await client.query("select set_config('request.jwt.claim.sub', $1, true)", [STAFF_ID]);
+    await client.query("set local role authenticated");
+  };
+
+  it("残高が同じでも、別ファイルの同じキーの行は読み飛ばさず「重複の疑い」として残す（別取引を消さない）", () =>
+    inTx(async () => {
+      await asStaff();
+      const a = await importRows("a.csv", csvA, 1);
+      expect(a.rows[0]).toMatchObject({ inserted_count: 1, skipped_duplicate_count: 0, suspected_duplicate_count: 0 });
+      const b = await importRows("b.csv", csvB, 2);
+      expect(b.rows[0]).toMatchObject({
+        inserted_count: 1, skipped_duplicate_count: 0, suspected_duplicate_count: 1,
+        income_total: "1000", expense_total: "1000",
+        inserted_amount_total: "1000", skipped_amount_total: "0", suspected_amount_total: "1000",
+      });
+      // 3件とも残っている。疑いの行は A の行を指し、人が「別の取引」か「重複」かを決める
+      expect(await txnCount()).toBe(3);
+      const suspected = await client.query(
+        `select t.status, t.balance, o.status as original_status, o.import_id <> t.import_id as from_other_file
+         from public.bank_transactions t join public.bank_transactions o on o.id = t.duplicate_of_id
+         where t.status = 'duplicate_suspected'`,
+      );
+      expect(suspected.rows).toEqual([{ status: "duplicate_suspected", balance: "9000", original_status: "new", from_other_file: true }]);
+    }));
+
+  it("同じ内容の取込全体を再実行したときだけ、残高のある行を読み飛ばす（順序が違っても同じ）。DB が内容から計算した識別を記録する", () =>
+    inTx(async () => {
+      await asStaff();
+      await importRows("a.csv", csvA, 1);
+      await importRows("b.csv", csvB, 2);
+      const before = await txnCount();
+      // A の再実行
+      expect((await importRows("a2.csv", csvA, 1)).rows[0]).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 1, suspected_duplicate_count: 0 });
+      // 疑いの行を含む B の再実行（行の順序が違っても同じ取込）。疑いが増えず、明細も増えない
+      expect((await importRows("b2.csv", [...csvB].reverse(), 2)).rows[0]).toMatchObject({
+        inserted_count: 0, skipped_duplicate_count: 2, suspected_duplicate_count: 0,
+        skipped_amount_total: "2000", suspected_amount_total: "0",
+      });
+      expect((await importRows("b3.csv", csvB, 2)).rows[0]).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 2, suspected_duplicate_count: 0 });
+      expect(await txnCount()).toBe(before);
+      const hashes = await client.query<{ batch_hash: string }>("select batch_hash from public.statement_imports where file_name in ('b.csv', 'b2.csv', 'b3.csv')");
+      expect(hashes.rows).toHaveLength(3);
+      expect(new Set(hashes.rows.map((r) => r.batch_hash)).size).toBe(1);
+      expect(hashes.rows[0]!.batch_hash).toMatch(/^[0-9a-f]{64}$/);
+      // 件数・金額の照合は読み飛ばしでも成り立つ（制約が受け付けている）
+      const rec = await client.query("select row_count, inserted_count, skipped_duplicate_count, suspected_duplicate_count from public.statement_imports where file_name = 'b2.csv'");
+      expect(rec.rows).toEqual([{ row_count: 2, inserted_count: 0, skipped_duplicate_count: 2, suspected_duplicate_count: 0 }]);
+    }));
+
+  it("一部だけ重なる取込は再実行ではないので、重なった行はすべて「重複の疑い」にする", () =>
+    inTx(async () => {
+      await asStaff();
+      await importRows("b.csv", csvB, 2);
+      const partial = [csvB[1]!, { ...salary, txn_date: "2026-10-06", dedupe_key: "x-salary-2" }];
+      expect((await importRows("partial.csv", partial, 2)).rows[0]).toMatchObject({ inserted_count: 1, skipped_duplicate_count: 0, suspected_duplicate_count: 1 });
+      // 重なりのない取込は影響を受けない
+      expect((await importRows("other.csv", [{ ...salary, txn_date: "2026-11-06", dedupe_key: "x-other" }], 1)).rows[0]).toMatchObject({ inserted_count: 1, suspected_duplicate_count: 0 });
+    }));
+
+  it("同じキーで行の内容（金額・摘要・残高・日付・入出金）が変わっていれば、読み飛ばさない", () =>
+    inTx(async () => {
+      await asStaff();
+      await importRows("a.csv", csvA, 1);
+      const changes: object[] = [{ amount: 2000 }, { description: "ｲｶﾞｲﾉﾃﾝﾎﾟ" }, { balance: 8000 }, { balance: null }, { txn_date: "2026-10-06" }, { direction: "income" }];
+      for (const [i, change] of changes.entries()) {
+        const res = await importRows(`changed${i}.csv`, [{ ...csvA[0], ...change }], 1);
+        expect(res.rows[0], JSON.stringify(change)).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 0, suspected_duplicate_count: 1 });
+      }
+      expect(await txnCount()).toBe(1 + changes.length);
+    }));
+
+  it("残高のない行は、取込全体の再実行でも読み飛ばさず「重複の疑い」にする（同内容のファイルを別々に取り込んだ別取引と区別できない）", () =>
+    inTx(async () => {
+      await asStaff();
+      const card = [{ ...shop, balance: null, dedupe_key: "x-card-1" }];
+      await importRows("c1.csv", card, 1);
+      const again = await importRows("c2.csv", card, 1);
+      expect(again.rows[0]).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 0, suspected_duplicate_count: 1 });
+      // 残高のある行と残高のない行が混ざる再実行: 残高のある行だけ読み飛ばす
+      const mixed = [{ ...shop, dedupe_key: "x-mix-1" }, { ...shop, balance: null, dedupe_key: "x-mix-2" }];
+      await importRows("m1.csv", mixed, 2);
+      expect((await importRows("m2.csv", mixed, 2)).rows[0]).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 1, suspected_duplicate_count: 1 });
+    }));
+
+  it("同じファイルに同じ内容の行が複数あっても（キーが別）取り込め、再実行は全部読み飛ばす。同じキーが2回あるファイルは拒否する", () =>
+    inTx(async () => {
+      await asStaff();
+      const twice = [{ ...shop, dedupe_key: "x-twice-1" }, { ...shop, dedupe_key: "x-twice-2" }];
+      expect((await importRows("t1.csv", twice, 2)).rows[0]).toMatchObject({ inserted_count: 2 });
+      expect((await importRows("t2.csv", twice, 2)).rows[0]).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 2 });
+      const message = await expectQueryError(
+        client,
+        "select * from public.import_bank_statement($1, $2, 'csv', 'dup.csv', 'bank_generic', $3, 2, '[]')",
+        [CUSTOMER_A, WALLET_A, JSON.stringify([twice[0], twice[0]])],
+      );
+      expect(message).toMatch(/重複キーが重なっています/);
+    }));
+
+  it("この変更より前の取込（識別なし）と同じキーの行は、内容が同じでも読み飛ばさず「重複の疑い」にする", () =>
+    inTx(async () => {
+      // 古い取込を再現する: batch_hash のない取込記録と明細を直接作る
+      const imp = await client.query<{ id: string }>(
+        `insert into public.statement_imports (customer_id, wallet_id, source, row_count, inserted_count, income_total, expense_total, inserted_amount_total)
+         values ($1, $2, 'csv', 1, 1, 0, 1000, 1000) returning id`,
+        [CUSTOMER_A, WALLET_A],
+      );
+      await client.query(
+        `insert into public.bank_transactions (customer_id, wallet_id, import_id, txn_date, amount, direction, description, balance, dedupe_key)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, 'x-shop-1')`,
+        [CUSTOMER_A, WALLET_A, imp.rows[0]!.id, shop.txn_date, shop.amount, shop.direction, shop.description, shop.balance],
+      );
+      await asStaff();
+      expect((await importRows("after-legacy.csv", csvA, 1)).rows[0]).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 0, suspected_duplicate_count: 1 });
+      // 取り込んだ記録には識別が付き、その再実行からは読み飛ばせる
+      expect((await importRows("after-legacy2.csv", csvA, 1)).rows[0]).toMatchObject({ skipped_duplicate_count: 1, suspected_duplicate_count: 0 });
+    }));
+
+  it("失敗した取込記録には識別が付かず、再実行の判定に影響しない", () =>
+    inTx(async () => {
+      await asStaff();
+      await importRows("a.csv", csvA, 1);
+      await client.query("select public.record_failed_statement_import($1, $2, 'csv', 'ng.csv', 'bank_generic', 1, $3)", [
+        CUSTOMER_A, WALLET_A, JSON.stringify([{ line: 2, message: "x" }]),
+      ]);
+      expect((await importRows("a2.csv", csvA, 1)).rows[0]).toMatchObject({ skipped_duplicate_count: 1 });
+      const failed = await client.query("select batch_hash from public.statement_imports where file_name = 'ng.csv'");
+      expect(failed.rows).toEqual([{ batch_hash: null }]);
+    }));
+
+  it("取込は顧客単位のロックを取って直列にする（トランザクションの終わりまで保持）", () =>
+    inTx(async () => {
+      await asStaff();
+      await importRows("a.csv", csvA, 1);
+      const locks = await client.query<{ n: string }>(
+        "select count(*) as n from pg_locks where locktype = 'advisory' and pid = pg_backend_pid() and granted",
+      );
+      expect(Number(locks.rows[0]!.n)).toBeGreaterThanOrEqual(1);
+    }));
 });
 
 describe("トップ画面の残件数（pending_transaction_counts）", () => {
@@ -622,6 +787,127 @@ describe("AI判断の記録", () => {
       expect(message).toMatch(/permission denied/);
     });
   });
+
+  // 遅れて届いた保存（同じ明細を未判定として読み込んだ別のジョブ）が、状態や人の判断を書き換えないこと。
+  // 注: ここは同じ接続での順次の再現（先の保存・保留が確定した後に、遅れた保存が届く結果）の検証。
+  // 2つの独立したセッションが同時に走る競合は、判断ログが追記専用で後から消せず共有のテストデータを汚すため再現していない。
+  // 同時実行での安全性は、確認と更新を1文（update ... where status = 'new'）で行う実装に依る
+  const decisionFor = (txnId: string, accountItemId = 101) =>
+    JSON.stringify({
+      customer_id: CUSTOMER_A,
+      bank_transaction_id: txnId,
+      transaction_snapshot: { amount: 9020 },
+      proposal: { account_item_id: accountItemId, tax_code: 21 },
+      confidence: "high",
+      confidence_breakdown: {},
+      model: null,
+      prompt_version: null,
+    });
+  const save = async (txnId: string, accountItemId = 101) => {
+    await client.query("reset role");
+    await client.query("set local role service_role");
+    return (await client.query<{ id: string }>("select public.record_ai_decision($1) as id", [decisionFor(txnId, accountItemId)])).rows[0]!.id;
+  };
+  const saveRejected = async (txnId: string) => {
+    await client.query("reset role");
+    await client.query("set local role service_role");
+    return expectQueryError(client, "select public.record_ai_decision($1)", [decisionFor(txnId, 102)]);
+  };
+  const asUser = async (userId: string) => {
+    await client.query("reset role");
+    await client.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
+    await client.query("set local role authenticated");
+  };
+  const snapshot = async (txnId: string) => {
+    await client.query("reset role");
+    const txn = await client.query("select status from public.bank_transactions where id = $1", [txnId]);
+    const decisions = await client.query("select id, proposal from public.ai_decisions where bank_transaction_id = $1 order by created_at, id", [txnId]);
+    const reviews = await client.query(
+      "select r.action, r.reason, r.reviewer_id from public.human_reviews r join public.ai_decisions d on d.id = r.ai_decision_id where d.bank_transaction_id = $1 order by r.created_at, r.action",
+      [txnId],
+    );
+    return { status: txn.rows[0]!.status, decisions: decisions.rows, reviews: reviews.rows };
+  };
+  async function inTx(fn: () => Promise<void>) {
+    await client.query("begin");
+    try {
+      await fn();
+    } finally {
+      await client.query("rollback");
+    }
+  }
+
+  it("候補作成済（proposed）の明細への重ねての保存は拒否し、最初の判断を置き換えない", () =>
+    inTx(async () => {
+      const txnId = await newTxn();
+      await save(txnId);
+      const before = await snapshot(txnId);
+      expect(before.status).toBe("proposed");
+      expect(await saveRejected(txnId)).toMatch(/not waiting for a proposal/);
+      expect(await snapshot(txnId)).toEqual(before);
+    }));
+
+  it("保留（on_hold）にした後に遅れて届いた保存は拒否し、保留・理由・判断ログを変えず、まとめて承認もできないまま", () =>
+    inTx(async () => {
+      const txnId = await newTxn();
+      const decisionId = await save(txnId); // ジョブ A
+      await asUser(STAFF_ID);
+      await client.query("select public.record_human_review($1, 'hold', null, '請求書の到着待ち', 3, false)", [decisionId]); // 人が保留
+      const before = await snapshot(txnId);
+      expect(before.status).toBe("on_hold");
+      expect(before.reviews).toEqual([{ action: "hold", reason: "請求書の到着待ち", reviewer_id: STAFF_ID }]);
+
+      expect(await saveRejected(txnId)).toMatch(/not waiting for a proposal/); // ジョブ B（遅れて保存）
+      const after = await snapshot(txnId);
+      expect(after).toEqual(before); // 状態・判断・保留の理由と記録が変わらない
+      expect(after.decisions).toHaveLength(1);
+
+      // 保留は解除されていないので、管理者でもまとめて承認はできない（1件ずつなら承認できる）
+      await asUser(ADMIN_ID);
+      const bulk = await expectQueryError(client, "select public.record_human_review($1, 'approve', null, null, 1, true)", [decisionId]);
+      expect(bulk).toMatch(/保留中の明細はまとめて承認できません/);
+      await client.query("select public.record_human_review($1, 'approve', null, null, 1, false)", [decisionId]);
+      expect((await snapshot(txnId)).status).toBe("approved");
+    }));
+
+  it("承認済・却下・登録済の明細には保存できず、状態も判断も変わらない", async () => {
+    for (const final of ["approve", "reject", "registered"] as const) {
+      await inTx(async () => {
+        const txnId = await newTxn();
+        const decisionId = await save(txnId);
+        if (final === "registered") {
+          await client.query("reset role");
+          await client.query("update public.bank_transactions set status = 'registered' where id = $1", [txnId]);
+        } else {
+          await asUser(ADMIN_ID);
+          await client.query("select public.record_human_review($1, $2, null, null, 1, false)", [decisionId, final]);
+        }
+        const before = await snapshot(txnId);
+        expect(before.status).toBe(final === "approve" ? "approved" : final === "reject" ? "rejected" : "registered");
+        expect(await saveRejected(txnId)).toMatch(/not waiting for a proposal/);
+        expect(await snapshot(txnId)).toEqual(before);
+      });
+    }
+  });
+
+  it("未判定（new）の明細には、1回だけ保存できる", () =>
+    inTx(async () => {
+      const txnId = await newTxn();
+      await save(txnId);
+      expect(await saveRejected(txnId)).toMatch(/not waiting for a proposal/);
+      expect((await snapshot(txnId)).decisions).toHaveLength(1);
+    }));
+
+  it("重複の疑いの明細には保存できず、人が「別の取引」として未判定（new）に戻せば保存できる", () =>
+    inTx(async () => {
+      const txnId = await newTxn();
+      await client.query("update public.bank_transactions set status = 'duplicate_suspected', duplicate_of_id = id where id = $1", [txnId]);
+      expect(await saveRejected(txnId)).toMatch(/not waiting for a proposal/);
+      await client.query("reset role");
+      await client.query("update public.bank_transactions set status = 'new' where id = $1", [txnId]);
+      await save(txnId);
+      expect((await snapshot(txnId)).status).toBe("proposed");
+    }));
 });
 
 describe("人の確認の記録（record_human_review）", () => {

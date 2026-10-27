@@ -1,6 +1,11 @@
 {
   "framework": "nextjs",
   "regions": ["hnd1"],
-  "git": { "deploymentEnabled": { "main": false } },
+  "git": {
+    "deploymentEnabled": {
+      "main": false,
+      "fix/csv-integrity-and-proposal-hold": false
+    }
+  },
   "crons": [{ "path": "/api/cron/propose", "schedule": "0 22 * * *" }]
 }
