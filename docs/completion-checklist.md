@@ -52,6 +52,18 @@
 
 このチェックリストはリリースや外部操作の自動許可ではありません。freee への書込・メール送信はこの文書追加 PR の対象外であり、この文書から実行権限は生じません。
 
+## 現在の状態（2026-10-27 確認。この下の2026-10-24時点の記載より優先する）
+
+- 対象: ブランチ `fix/csv-integrity-and-proposal-hold` の `b5df4ac19464c7455f1310d43780d32c7ef354c1`。ドラフト PR [#4](https://github.com/k-akiya-a11y/MVP/pull/4)（base `claude/project-thread-xd7oh4`、PR2 head `3908033`）。マージ・デプロイなし。
+- **確認済み（証拠付き）**: [CI 実行 40457194935](https://github.com/k-akiya-a11y/MVP/actions/runs/40457194935) が success（PR マージ用テストコミット `a8f27696b976ea04e0ed696cbac5dece12dc80ba` 上）。`check`（job 122033148339）は lint・型チェック・ユニット 40 ファイル 401 件・build が成功。`db`（job 122033148582）は PostgreSQL 16.15 で shim・全マイグレーション・seed が成功し、DB テスト 6 ファイル 113 件（競合 12、アップグレード 9 を含む）が成功。詳細は[CI検証の手順](ci-validation.md)の冒頭。
+- **この確認の範囲**: 汎用 PostgreSQL・shim・合成データ。**実 Supabase の認証・RLS・Vault、ブラウザ、実モデルでの確認ではない。** Windows でブロックされたバイナリーは実行・迂回していない。
+- **Vercel**: 連携プロジェクトを確認（ユーザー提供のスクリーンショット）。このブランチだけ `deploymentEnabled: false` を追加（承認済み）。公開後の読取で新しいデプロイは観測されず、最新は従来の `3908033`。継続確認であり将来の保証ではない。[deployment-hold.md](deployment-hold.md) の保留は維持。
+- **後続コミットの CI は未確認**: この文書更新だけの後続コミットは、CI の結果をまだ確認していない。確認後に SHA と結果を追記する。`b5df4ac` の成功を代用しない。
+- **残る実ゲート（すべて未実施）**: ① 実 Supabase（実認証・RLS・Vault・Google ログイン、管理者／担当者の別アカウントでの許可と拒否）、② ブラウザでの通し確認、③ 実モデルでの精度・誤高確信・費用・遅延の評価、④ ステージングと本番の分離、停止・アプリロールバック・DB 復元の演習、⑤ Ken の対象版・範囲を明示したリリース承認。
+- **判定**: 検証完了でもリリース承認済みでもない。「リリース可能」とは判定しない。
+
+以下の「初回提供の範囲」節と未完了チェックの「未実行」「未コミット」などは**当時の記録**であり、CI が実行されたという一点については上記が現在の状態。ただし各チェック項目の完了（実 DB／実認証／ブラウザ／実モデル／復旧／承認）は上記の確認では満たされない。チェック欄は書き換えていない。
+
 ## 初回提供の範囲と準備状況（2026-10-24）
 
 Kenは「CSV取込→仕訳候補→人が確認」から使い始め、入金照合等を順次追加する初回範囲に「その実装範囲で大丈夫」と回答した。これは範囲の承認であり、上記の検証/公開ゲートの免除、マージ/デプロイ/本番データ利用の許可ではない。[設計書](design.md)と[作業報告・機能台帳A〜I](reviews/2026-10-23-csv-and-hold-fixes.md)に対応する。過去の「初回範囲未決定」は当時の記録として保持する。
@@ -81,7 +93,7 @@ Kenは「CSV取込→仕訳候補→人が確認」から使い始め、入金�
 - [ ] 対象顧客/確認担当者・運用頻度/候補生成の起動方法・計測基準を決める。Cron保留の解除は別判断。KPI達成は未測定。
 - [ ] 依存リスク・環境分離・停止/アプリrollback/DB復元の演習・公開保留の実状態を確認し、対象版を固定してKenの公開承認を得る。[deployment-hold.md](deployment-hold.md)の保留は維持する。
 
-CI（`.github/workflows/ci.yml`）と、固定ベースラインからのupgradeテスト（`tests/db/upgrade.test.ts`）・ルール/メモの2セッション競合テスト（`tests/db/concurrency.test.ts`）の実行手順・前提・残るゲートは[CI検証の手順](ci-validation.md)に記録した。これらのテストは作成済みだが、どの環境でも未実行（Windows AppControlの実行拒否は迂回していない）で、CIの成功は主張しない。上のチェックは実行結果の確認までは完了にしない。
+CI（`.github/workflows/ci.yml`）と、固定ベースラインからのupgradeテスト（`tests/db/upgrade.test.ts`）・ルール/メモの2セッション競合テスト（`tests/db/concurrency.test.ts`）の実行手順・前提・残るゲートは[CI検証の手順](ci-validation.md)に記録した。これらのテストは作成済みだが、記載時点ではどの環境でも未実行（Windows AppControlの実行拒否は迂回していない）で、CIの成功は主張しなかった。（2026-10-27にCI上で成功を確認。冒頭の「現在の状態」を参照。実DB・実認証・ブラウザ・実モデルの確認ではない。）上のチェックは実行結果の確認までは完了にしない。
 
 DBの正確な前提・Windows用適用手順・upgrade/2接続の未自動化ケースは[作業報告の最終ゲート](reviews/2026-10-23-csv-and-hold-fixes.md#最終的に残るゲートすべて未実施)を参照。許可されたDBで適用後に `npm.cmd run test:db -- tests/db/schema.test.ts tests/db/rule-create.test.ts tests/db/note-create.test.ts`、`npm.cmd run test:db -- tests/db/concurrency.test.ts`、`npm.cmd run test:db`。`db:apply`/`db:test:local`はBash前提であり、Windows上で直接動くと仮定しない。
 
