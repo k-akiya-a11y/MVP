@@ -167,3 +167,179 @@ describe("submitStatementUpload", () => {
     expect(fetchFn.mock.calls[0]?.[1]).toMatchObject({ method: "POST" });
   });
 });
+
+/** 件数・金額が全部 0 の土台。ケースごとに必要な項目だけ上書きする */
+const ZERO = {
+  importId: "00000000-0000-4000-8000-0000000000c1",
+  insertedCount: 0,
+  skippedDuplicateCount: 0,
+  suspectedDuplicateCount: 0,
+  ignoredCount: 0,
+  incomeTotal: 0,
+  expenseTotal: 0,
+  insertedAmountTotal: 0,
+  skippedAmountTotal: 0,
+  suspectedAmountTotal: 0,
+};
+
+describe("submitStatementUpload: 応答内の金額保存則（入金+出金 = 登録+読み飛ばし+疑い）", () => {
+  // 合計 600 円（入金 500 + 出金 100）に対する内訳を変えたケース。件数は金額と対応させてある
+  const BASE600 = {
+    ...ZERO,
+    insertedCount: 1,
+    skippedDuplicateCount: 1,
+    suspectedDuplicateCount: 1,
+    incomeTotal: 500,
+    expenseTotal: 100,
+    insertedAmountTotal: 100,
+    skippedAmountTotal: 300,
+    suspectedAmountTotal: 200,
+  };
+
+  it("基準の 600 円は成功のまま", async () => {
+    const { promise } = run(async () => json({ ok: true, ...BASE600 }, 200));
+    expect((await promise).kind).toBe("success");
+  });
+
+  const mismatches: [string, Record<string, number>][] = [
+    ["内訳が 1 円少ない（599 円）", { suspectedAmountTotal: 199 }],
+    ["内訳が 1 円多い（601 円）", { suspectedAmountTotal: 201 }],
+    ["入金側が 1 円多い", { incomeTotal: 501 }],
+    ["出金側が 1 円少ない", { expenseTotal: 99 }],
+    ["内訳の登録分だけ大きくずれる（1,100 円）", { insertedAmountTotal: 600 }],
+    ["読み飛ばし分が 1 円ずれる", { skippedAmountTotal: 301 }],
+  ];
+
+  it.each(mismatches)("合計と内訳が一致しなければ結果不明: %s", async (_name, override) => {
+    const { promise, fetchFn } = run(async () => json({ ok: true, ...BASE600, ...override }, 200));
+    const outcome = await promise;
+    expect(outcome).toEqual({ kind: "unknown", message: UPLOAD_UNKNOWN_MESSAGE });
+    expect(outcome.message).not.toContain("登録 1件");
+    expect(outcome.message).not.toContain("600");
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("浮動小数点の和では丸めで一致して見える不整合（2^53+1 と 2^53）も結果不明", async () => {
+    // 入金+出金 = 2^53 + 1、内訳 = 2^53。number の足し算ではどちらも 2^53 になり見逃す
+    const body = {
+      ...ZERO,
+      insertedCount: 1,
+      skippedDuplicateCount: 1,
+      incomeTotal: Number.MAX_SAFE_INTEGER,
+      expenseTotal: 2,
+      insertedAmountTotal: Number.MAX_SAFE_INTEGER,
+      skippedAmountTotal: 1,
+    };
+    const { promise } = run(async () => json({ ok: true, ...body }, 200));
+    expect(await promise).toEqual({ kind: "unknown", message: UPLOAD_UNKNOWN_MESSAGE });
+  });
+
+  it("合計が MAX_SAFE_INTEGER を超えても、正確に一致していれば成功", async () => {
+    // 入金 MAX_SAFE + 出金 1 = 2^53、内訳 MAX_SAFE + 1 = 2^53
+    const body = {
+      ...ZERO,
+      insertedCount: 1,
+      skippedDuplicateCount: 1,
+      incomeTotal: Number.MAX_SAFE_INTEGER,
+      expenseTotal: 1,
+      insertedAmountTotal: Number.MAX_SAFE_INTEGER,
+      skippedAmountTotal: 1,
+    };
+    const { promise } = run(async () => json({ ok: true, ...body }, 200));
+    expect((await promise).kind).toBe("success");
+  });
+
+  // 合計は一致させ、件数と金額の対応だけを崩したケース
+  const countAmount: [string, Record<string, number>][] = [
+    ["登録 0 件なのに登録金額が正", { insertedCount: 0, skippedDuplicateCount: 1, suspectedDuplicateCount: 0, insertedAmountTotal: 60, skippedAmountTotal: 540, suspectedAmountTotal: 0 }],
+    ["読み飛ばし 0 件なのに読み飛ばし金額が正", { insertedCount: 1, skippedDuplicateCount: 0, suspectedDuplicateCount: 0, insertedAmountTotal: 100, skippedAmountTotal: 500, suspectedAmountTotal: 0 }],
+    ["疑い 0 件なのに疑い金額が正", { insertedCount: 1, skippedDuplicateCount: 1, suspectedDuplicateCount: 0, insertedAmountTotal: 100, skippedAmountTotal: 300, suspectedAmountTotal: 200 }],
+    ["登録 1 件なのに登録金額が 0 円", { insertedCount: 1, skippedDuplicateCount: 1, suspectedDuplicateCount: 0, insertedAmountTotal: 0, skippedAmountTotal: 600, suspectedAmountTotal: 0 }],
+    ["読み飛ばし 1 件なのに読み飛ばし金額が 0 円", { insertedCount: 1, skippedDuplicateCount: 1, suspectedDuplicateCount: 0, insertedAmountTotal: 600, skippedAmountTotal: 0, suspectedAmountTotal: 0 }],
+    ["疑い 1 件なのに疑い金額が 0 円", { insertedCount: 1, skippedDuplicateCount: 0, suspectedDuplicateCount: 1, insertedAmountTotal: 600, skippedAmountTotal: 0, suspectedAmountTotal: 0 }],
+  ];
+
+  it.each(countAmount)("件数と金額が対応しなければ結果不明: %s", async (_name, override) => {
+    const { promise, fetchFn } = run(async () => json({ ok: true, ...BASE600, ...override }, 200));
+    expect(await promise).toEqual({ kind: "unknown", message: UPLOAD_UNKNOWN_MESSAGE });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["件数が安全でない整数", { insertedCount: 2 ** 60 }],
+    ["金額が安全でない整数", { incomeTotal: 2 ** 60, insertedAmountTotal: 2 ** 60 }],
+    ["無視行数が安全でない整数", { ignoredCount: 2 ** 60 }],
+  ])("安全でない整数を含む応答は結果不明: %s", async (_name, override) => {
+    const { promise } = run(async () => json({ ok: true, ...BASE600, ...override }, 200));
+    expect(await promise).toEqual({ kind: "unknown", message: UPLOAD_UNKNOWN_MESSAGE });
+  });
+
+  it("件数の合計が MAX_SAFE_INTEGER を超えても、読めた行は丸めずに表示する", async () => {
+    // 件数は MAX_SAFE + 2 = 9007199254740993 のまま。金額は 1 件 1 円未満にならないよう、
+    // 入金+出金 = MAX_SAFE + 2 = 登録 MAX_SAFE + 読み飛ばし 1 + 疑い 1 で正確に一致させる
+    const body = {
+      ...ZERO,
+      insertedCount: Number.MAX_SAFE_INTEGER,
+      skippedDuplicateCount: 1,
+      suspectedDuplicateCount: 1,
+      incomeTotal: Number.MAX_SAFE_INTEGER,
+      expenseTotal: 2,
+      insertedAmountTotal: Number.MAX_SAFE_INTEGER,
+      skippedAmountTotal: 1,
+      suspectedAmountTotal: 1,
+    };
+    const { promise } = run(async () => json({ ok: true, ...body }, 200));
+    const outcome = await promise;
+    expect(outcome.kind).toBe("success");
+    expect(outcome.message).toContain("読めた行 9007199254740993件");
+  });
+
+  it("金額が文字列の応答は、合計が合っていても成功にしない", async () => {
+    const { promise } = run(async () => json({ ok: true, ...BASE600, incomeTotal: "500" }, 200));
+    expect(await promise).toEqual({ kind: "unknown", message: UPLOAD_UNKNOWN_MESSAGE });
+  });
+
+  // 「正当」は応答の形が保存則を満たすという意味で、実際の取込が成功した例を意味しない
+  describe("保存則を満たす応答は成功のまま（応答の形の検証であり、実取込の成功例ではない）", () => {
+    it("完全再取込: 登録 0 件・読み飛ばしだけ", async () => {
+      const { promise } = run(async () =>
+        json({ ...ZERO, ok: true, skippedDuplicateCount: 4, incomeTotal: 700, expenseTotal: 300, skippedAmountTotal: 1000 }, 200),
+      );
+      const outcome = await promise;
+      expect(outcome.kind).toBe("success");
+      expect(outcome.message).toContain("読めた行 4件（入金 700円・出金 300円）");
+      expect(outcome.message).toContain("登録 0件 0円");
+      expect(outcome.message).toContain("取込済みのため読み飛ばし 4件 1,000円");
+    });
+
+    it("重複の疑いだけ", async () => {
+      const { promise } = run(async () =>
+        json({ ...ZERO, ok: true, suspectedDuplicateCount: 2, expenseTotal: 800, suspectedAmountTotal: 800 }, 200),
+      );
+      const outcome = await promise;
+      expect(outcome.kind).toBe("success");
+      expect(outcome.message).toContain("重複の疑い 2件 800円");
+    });
+
+    it("入金だけ・出金だけ", async () => {
+      const a = run(async () => json({ ...ZERO, ok: true, insertedCount: 2, incomeTotal: 900, insertedAmountTotal: 900 }, 200));
+      const b = run(async () => json({ ...ZERO, ok: true, insertedCount: 1, expenseTotal: 50, insertedAmountTotal: 50 }, 200));
+      expect((await a.promise).kind).toBe("success");
+      expect((await b.promise).kind).toBe("success");
+    });
+
+    // 応答の形が保存則（0 = 0）を満たすかだけを見る境界のテスト。
+    // 実際の 0 円だけの CSV は取込成功ではなく 422 で拒否される（この応答は実取込の成功例ではない）
+    it("全ゼロの応答保存則の境界（実際の0円だけCSVは422）", async () => {
+      const { promise } = run(async () => json({ ...ZERO, ok: true, ignoredCount: 3 }, 200));
+      const outcome = await promise;
+      expect(outcome.kind).toBe("success");
+      expect(outcome.message).toContain("金額0のため取引にしなかった行 3件");
+    });
+
+    it("ignoredCount があっても保存則の対象にしない（基準の応答）", async () => {
+      const { promise } = run(async () => json({ ok: true, ...COUNTS, ignoredCount: 9 }, 200));
+      expect((await promise).kind).toBe("success");
+    });
+  });
+});

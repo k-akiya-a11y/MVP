@@ -73,7 +73,7 @@ export async function submitStatementUpload(
 
   if (res.status >= 200 && res.status < 300) {
     const parsed = successSchema.safeParse(json);
-    return parsed.success ? { kind: "success", message: importSummary(parsed.data) } : unknown();
+    return parsed.success && isConsistent(parsed.data) ? { kind: "success", message: importSummary(parsed.data) } : unknown();
   }
 
   if (res.status === 422) {
@@ -97,12 +97,36 @@ export async function submitStatementUpload(
   return unknown();
 }
 
+/**
+ * 応答内の保存則: 全項目が安全な整数で、入金+出金 = 登録+読み飛ばし+疑い（BigInt で正確に比較）、
+ * かつ分類ごとに「件数 0 ⇔ 金額 0」。満たさない応答は成功と扱わない（DB の制約があるので通常は起きない多層防御）
+ */
+function isConsistent(c: z.infer<typeof successSchema>): boolean {
+  const values = [
+    c.insertedCount, c.skippedDuplicateCount, c.suspectedDuplicateCount, c.ignoredCount,
+    c.incomeTotal, c.expenseTotal, c.insertedAmountTotal, c.skippedAmountTotal, c.suspectedAmountTotal,
+  ];
+  if (!values.every(Number.isSafeInteger)) return false;
+  const pairs: [number, number][] = [
+    [c.insertedCount, c.insertedAmountTotal],
+    [c.skippedDuplicateCount, c.skippedAmountTotal],
+    [c.suspectedDuplicateCount, c.suspectedAmountTotal],
+  ];
+  if (!pairs.every(([n, amount]) => (n === 0) === (amount === 0))) return false;
+  return (
+    BigInt(c.incomeTotal) + BigInt(c.expenseTotal) ===
+    BigInt(c.insertedAmountTotal) + BigInt(c.skippedAmountTotal) + BigInt(c.suspectedAmountTotal)
+  );
+}
+
 const yen = (n: number) => n.toLocaleString("ja-JP");
 
 /** 取込結果の件数と金額。読めた行 = 登録 + 読み飛ばし + 重複の疑い で照合できるように並べる */
 export function importSummary(c: ImportCounts): string {
+  // 件数の合計は number の足し算で丸めないよう BigInt で出す
+  const readRows = BigInt(c.insertedCount) + BigInt(c.skippedDuplicateCount) + BigInt(c.suspectedDuplicateCount);
   const lines = [
-    `読めた行 ${c.insertedCount + c.skippedDuplicateCount + c.suspectedDuplicateCount}件（入金 ${yen(c.incomeTotal)}円・出金 ${yen(c.expenseTotal)}円）`,
+    `読めた行 ${readRows}件（入金 ${yen(c.incomeTotal)}円・出金 ${yen(c.expenseTotal)}円）`,
     `登録 ${c.insertedCount}件 ${yen(c.insertedAmountTotal)}円`,
     `取込済みのため読み飛ばし ${c.skippedDuplicateCount}件 ${yen(c.skippedAmountTotal)}円`,
   ];

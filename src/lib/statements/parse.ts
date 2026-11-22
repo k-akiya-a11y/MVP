@@ -44,29 +44,59 @@ function normalizeHeader(s: string): string {
   return s.normalize("NFKC").replace(/\s/g, "");
 }
 
-/** 見出し行を探す（先頭10行のうち、日付と摘要の列がそろう最初の行） */
+const FIELD_LABELS = {
+  date: "日付",
+  description: "摘要",
+  withdrawal: "出金",
+  deposit: "入金",
+  signedAmount: "金額",
+  balance: "残高",
+} as const;
+
+/**
+ * 見出し行を探す（先頭10行のうち、日付と摘要の列がそろう最初の行）。
+ * 同じ意味に当たる物理列が2つ以上ある見出しは、最初の列だけを使って残りを黙って無視しないよう、
+ * 列を決めずに ambiguous で返す（同じ物理列が複数の別名に一致するだけなら曖昧ではない）。
+ */
 function locateHeader(table: string[][], format: StatementCsvFormat) {
   for (let i = 0; i < Math.min(table.length, 10); i++) {
-    const headers = (table[i] ?? []).map(normalizeHeader);
-    const find = (candidates?: string[]) => {
-      if (!candidates) return -1;
-      for (const c of candidates) {
-        const idx = headers.indexOf(normalizeHeader(c));
-        if (idx >= 0) return idx;
+    const cells = table[i] ?? [];
+    const headers = cells.map(normalizeHeader);
+    const matches = (candidates?: string[]): number[] => {
+      const found = new Set<number>();
+      for (const c of candidates ?? []) {
+        const key = normalizeHeader(c);
+        headers.forEach((h, idx) => {
+          if (h === key) found.add(idx);
+        });
       }
-      return -1;
+      return [...found].sort((a, b) => a - b);
     };
-    const date = find(format.columns.date);
-    const description = find(format.columns.description);
-    if (date < 0 || description < 0) continue;
+    const m = {
+      date: matches(format.columns.date),
+      description: matches(format.columns.description),
+      withdrawal: matches(format.columns.withdrawal),
+      deposit: matches(format.columns.deposit),
+      signedAmount: matches(format.columns.signedAmount),
+      balance: matches(format.columns.balance),
+    };
+    if (m.date.length === 0 || m.description.length === 0) continue;
+    const ambiguous = (Object.keys(m) as (keyof typeof m)[])
+      .filter((k) => m[k].length > 1)
+      .map((k) => {
+        const where = m[k].map((idx) => `${idx + 1}列目「${(cells[idx] ?? "").trim()}」`).join("、");
+        return `「${FIELD_LABELS[k]}」の列が複数あります（${where}）。どれを使うか判断できないため取り込めません`;
+      });
+    const first = (k: keyof typeof m) => m[k][0] ?? -1;
     return {
       headerIndex: i,
-      date,
-      description,
-      withdrawal: find(format.columns.withdrawal),
-      deposit: find(format.columns.deposit),
-      signedAmount: find(format.columns.signedAmount),
-      balance: find(format.columns.balance),
+      ambiguous,
+      date: first("date"),
+      description: first("description"),
+      withdrawal: first("withdrawal"),
+      deposit: first("deposit"),
+      signedAmount: first("signedAmount"),
+      balance: first("balance"),
     };
   }
   return null;
@@ -103,7 +133,34 @@ export function parseStatementCsv(text: string, format: StatementCsvFormat): Sta
       sourceRowCount: countDataRows(table, 0),
     };
   }
-  const hasSplitColumns = header.withdrawal >= 0 || header.deposit >= 0;
+  if (header.ambiguous.length > 0) {
+    // 行の解釈（金額0の扱いを含む）より先に止める。見出しとして選んだ行の物理行番号で報告する
+    const line = csvRows[header.headerIndex]!.line;
+    return {
+      rows: [],
+      errors: header.ambiguous.map((message) => ({ line, message })),
+      ignored: [],
+      sourceRowCount: countDataRows(table, header.headerIndex + 1),
+    };
+  }
+  // 出金・入金の両列を定義した形式で片方の見出しだけ認識できたとき、認識できなかった側は
+  // 空欄 = 金額0として読まれ、その側の取引が黙って捨てられる。行を読む前にファイル全体を止める
+  const defined = (candidates?: string[]) => (candidates?.length ?? 0) > 0;
+  if (defined(format.columns.withdrawal) && defined(format.columns.deposit) && (header.withdrawal >= 0) !== (header.deposit >= 0)) {
+    const missing = header.withdrawal < 0 ? FIELD_LABELS.withdrawal : FIELD_LABELS.deposit;
+    return {
+      rows: [],
+      errors: [
+        {
+          line: csvRows[header.headerIndex]!.line,
+          message: `「${missing}」の列が見つかりません。この形式（${format.label}）では出金と入金の両方の見出しが必要です。片方だけでは、もう一方の金額を0円として読んでしまうため取り込めません`,
+        },
+      ],
+      ignored: [],
+      sourceRowCount: countDataRows(table, header.headerIndex + 1),
+    };
+  }
+  const hasSplitColumns =header.withdrawal >= 0 || header.deposit >= 0;
   if (!hasSplitColumns && header.signedAmount < 0) {
     return {
       rows: [],
@@ -135,6 +192,10 @@ export function parseStatementCsv(text: string, format: StatementCsvFormat): Sta
       }
       const txnDate = parseStatementDate(cell(r, header.date));
       const description = cell(r, header.description).trim();
+      // PostgreSQL の text 型は U+0000 を保存できない。金額0の ignored に落とさず、値も書き換えず、行のエラーにする
+      if (description.includes("\u0000")) {
+        throw new Error("摘要に NUL（U+0000）が含まれています。データベースに保存できないため取り込めません");
+      }
       let signed: number; // 正 = 出金
       if (hasSplitColumns) {
         const out = parseYen(cell(r, header.withdrawal)) ?? 0;
@@ -144,8 +205,15 @@ export function parseStatementCsv(text: string, format: StatementCsvFormat): Sta
         }
         signed = out !== 0 ? out : -inn;
       } else {
-        signed = parseYen(cell(r, header.signedAmount)) ?? 0;
+        // 符号付き1列（カード）の空欄は金額が不明であって0ではない。0として ignored にせず行のエラーにする
+        const parsed = parseYen(cell(r, header.signedAmount));
+        if (parsed === null) {
+          throw new Error("金額が空欄です（金額0ではなく金額が不明な行です。明示的な0とは区別します）");
+        }
+        signed = parsed;
       }
+      // 金額0の行でも残高欄が壊れていれば読めない行として扱う（0なら黙って無視、にしない）
+      const balance = parseYen(cell(r, header.balance));
       if (signed === 0) {
         ignored.push({ line, reason: "金額が0（残高照会などの行）" });
         continue;
@@ -159,7 +227,7 @@ export function parseStatementCsv(text: string, format: StatementCsvFormat): Sta
         amount: Math.abs(signed),
         direction: signed > 0 ? "expense" : "income",
         description,
-        balance: parseYen(cell(r, header.balance)),
+        balance,
       });
     } catch (error) {
       errors.push({ line, message: error instanceof Error ? error.message : String(error) });

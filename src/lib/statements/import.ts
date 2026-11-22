@@ -95,6 +95,15 @@ export async function importStatementCsv(
   if (parsed.rows.length === 0) {
     return fail([{ line: 0, message: "取引の行がありません" }], sourceRowCount);
   }
+  // 1行ごとには安全でも、合計が安全な整数を超えると、登録後に集計値を検証できなくなる。登録の前に、正確な整数（BigInt）で数えて拒否する
+  const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+  let sum = 0n;
+  for (const row of parsed.rows) {
+    sum += BigInt(row.amount);
+    if (sum > maxSafe) {
+      return fail([{ line: row.line, message: "取込む行の金額の合計が大きすぎます（安全に集計できる範囲を超えています）" }], sourceRowCount);
+    }
+  }
   const keys = buildDedupeKeys(target.walletId, parsed.rows);
   const rows: StatementImportRow[] = parsed.rows.map((row, i) => ({
     txn_date: row.txnDate,
