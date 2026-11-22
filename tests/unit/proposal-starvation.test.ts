@@ -712,6 +712,85 @@ describe("runProposalJob: 時間の上限", () => {
     expect(result).toEqual(snapshot);
   });
 
+  it("別の明細の DB 待ちが締切をまたいでいる間に、先の AI 応答が締切後に届いても、判断ログを書かない", async () => {
+    const db = new FakeDb([aiRow(1), aiRow(2)]);
+    const base = db.store();
+    let t = 0;
+    let unblockContext: () => void = () => undefined;
+    let contextBlocked = false;
+    const rows: Parameters<ProposalStore["recordDecision"]>[0][] = [];
+    const store: ProposalStore & { owner: string } = {
+      ...base,
+      loadCustomerContext: async (customerId, today) => {
+        if (contextBlocked === false && db.leases.has("t0002") && db.leases.get("t0002")?.owner === base.owner) {
+          contextBlocked = true;
+          await new Promise<void>((resolve) => (unblockContext = resolve));
+        }
+        return base.loadCustomerContext(customerId, today);
+      },
+      recordDecision: async (d) => {
+        rows.push(d);
+        return base.recordDecision(d);
+      },
+    };
+    let finishLate: (r: AiCallResult) => void = () => undefined;
+    const ai = vi.fn<JournalAi>(() => new Promise<AiCallResult>((resolve) => (finishLate = resolve)));
+    const running = runProposalJob({ store, ai, today: TODAY, now: () => t, aiTimeoutMs: 5, lateDeadlineMs: 1_000, budgetMs: 900 });
+
+    // t0001 は待ちきれずに次へ進み、t0002 の文脈読込（DB 待ち）で止まっている
+    await vi.waitFor(() => expect(contextBlocked).toBe(true));
+    t = 2_000; // 時計が締切を過ぎる（実行はまだ finally に入っていない）
+    finishLate(okResult); // 先の t0001 の応答が締切後に届く
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(rows).toEqual([]);
+
+    unblockContext();
+    const result = await running;
+    expect(rows).toEqual([]);
+    expect(db.recorded).toEqual([]);
+    expect(result.processed).toBe(0);
+    expect(result.failures).toContainEqual({ bankTransactionId: "t0001", error: expect.stringContaining("終わりませんでした") });
+  });
+
+  it("書込が締切をまたいで終わり、実行がまだ続いていても、成功に数えない", async () => {
+    const db = new FakeDb([aiRow(1), aiRow(2)]);
+    const base = db.store();
+    let t = 0;
+    let unblockContext: () => void = () => undefined;
+    let contextBlocked = false;
+    let finishRecord: () => void = () => undefined;
+    let recordStarted = false;
+    const store: ProposalStore & { owner: string } = {
+      ...base,
+      loadCustomerContext: async (customerId, today) => {
+        if (!contextBlocked && db.leases.get("t0002")?.owner === base.owner) {
+          contextBlocked = true;
+          await new Promise<void>((resolve) => (unblockContext = resolve));
+        }
+        return base.loadCustomerContext(customerId, today);
+      },
+      recordDecision: async (d) => {
+        recordStarted = true;
+        await new Promise<void>((resolve) => (finishRecord = resolve));
+        return base.recordDecision(d);
+      },
+    };
+    let finishLate: (r: AiCallResult) => void = () => undefined;
+    const ai = vi.fn<JournalAi>(() => new Promise<AiCallResult>((resolve) => (finishLate = resolve)));
+    const running = runProposalJob({ store, ai, today: TODAY, now: () => t, aiTimeoutMs: 5, lateDeadlineMs: 1_000, budgetMs: 900 });
+
+    await vi.waitFor(() => expect(contextBlocked).toBe(true));
+    finishLate(okResult); // 締切前に届き、書込を始める
+    await vi.waitFor(() => expect(recordStarted).toBe(true));
+    t = 2_000; // 書込の途中で締切を過ぎる
+    finishRecord();
+    await vi.waitFor(() => expect(db.recorded).toEqual(["t0001"]));
+    unblockContext();
+    const result = await running;
+    expect(result.processed).toBe(0);
+    expect(result.failures).toContainEqual({ bankTransactionId: "t0001", error: expect.stringContaining("記録されたかは不明") });
+  });
+
   it("待ちきれなかった後に元の処理が失敗したら、未処理の拒否として落とさず、貸出しを返して次の巡回で判定し直す", async () => {
     const db = new FakeDb([aiRow(1)]);
     let failLate: (e: Error) => void = () => undefined;

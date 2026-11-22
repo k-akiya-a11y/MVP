@@ -123,13 +123,16 @@ export async function runProposalJob(
   const late: Promise<void>[] = [];
   // 締切（LATE_DEADLINE_MS）を過ぎたら受付を閉じる。閉じた後に届いた結果は記録せず、返した結果も書き換えない
   let lateClosed = false;
+  const pastLateDeadline = () => now() - startedAt >= lateDeadlineMs;
+  const unknownRecordError = (id: string) => `締切までに判断ログの記録が終わらず、記録されたかは不明です（${id}）`;
   // 締切の時点で記録（DB 書込）を始めていて、まだ終わっていない明細の失敗。締切後は結果不明として確定扱いにしない
   const recording = new Set<{ bankTransactionId: string; error: string }>();
   const followLate = (txnId: string, pending: Promise<DecisionDraft>, failure: { bankTransactionId: string; error: string }) => {
     late.push(
       pending.then(
         async (draft) => {
-          if (lateClosed) return;
+          // 締切は実行の終わり（finally）を待たず、時計で判定する（別の明細の DB 待ちが締切をまたいでいても受け付けない）
+          if (lateClosed || pastLateDeadline()) return;
           recording.add(failure);
           try {
             await deps.store.recordDecision(toAiDecisionRow(draft));
@@ -141,6 +144,11 @@ export async function runProposalJob(
             if (!lateClosed) recording.delete(failure);
           }
           if (lateClosed) return;
+          if (pastLateDeadline()) {
+            // 書込は締切をまたいで終わった。締切後の集計はしないので、成功に数えない（記録途中で締切を迎えたものと同じ扱い）
+            failure.error = unknownRecordError(failure.bankTransactionId);
+            return;
+          }
           result.failures.splice(result.failures.indexOf(failure), 1);
           result.processed++;
           result.byConfidence[draft.confidence.level]++;
@@ -216,7 +224,7 @@ export async function runProposalJob(
       lateClosed = true;
       // 記録の途中で締切を迎えたものは、DB に記録されたかが分からない。成功扱いにせず、貸出しも返さない（記録済みなら次の巡回で new でないため渡らない）
       for (const failure of recording) {
-        failure.error = `締切までに判断ログの記録が終わらず、記録されたかは不明です（${failure.bankTransactionId}）`;
+        failure.error = unknownRecordError(failure.bankTransactionId);
       }
     }
     const release = owned.filter((t) => !settled.has(t.id)).map((t) => t.id);
