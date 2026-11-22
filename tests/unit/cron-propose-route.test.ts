@@ -77,6 +77,8 @@ describe("GET /api/cron/propose の実行", () => {
       processed: 3,
       byConfidence: { high: 2, medium: 1, low: 0 },
       failures: [],
+      attempted: 3,
+      truncated: false,
     } satisfies ProposalRunResult;
     jobMock.mockResolvedValue(result);
 
@@ -93,6 +95,8 @@ describe("GET /api/cron/propose の実行", () => {
       processed: 0,
       byConfidence: { high: 0, medium: 0, low: 0 },
       failures: [],
+      attempted: 0,
+      truncated: false,
     } satisfies ProposalRunResult;
     jobMock.mockResolvedValue(result);
 
@@ -112,6 +116,8 @@ describe("GET /api/cron/propose の実行", () => {
         { bankTransactionId: "txn-1", error: "ai_invalid_output" },
         { bankTransactionId: "txn-2", error: "log_write_failed" },
       ],
+      attempted: 3,
+      truncated: true,
     } satisfies ProposalRunResult;
     jobMock.mockResolvedValue(result);
 
@@ -127,6 +133,8 @@ describe("GET /api/cron/propose の実行", () => {
       processed: 0,
       byConfidence: { high: 0, medium: 0, low: 0 },
       failures: [],
+      attempted: 0,
+      truncated: false,
     } satisfies ProposalRunResult);
 
     vi.stubEnv("CRON_SECRET", SECRET);

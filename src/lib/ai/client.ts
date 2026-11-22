@@ -26,6 +26,9 @@ export type AiCallResult =
 /** 仕訳案を作る AI。テストではモックに差し替える */
 export type JournalAi = (prompt: ReturnType<typeof buildJournalPrompt>) => Promise<AiCallResult>;
 
+/** NUL を含む回答を断るときの固定文言（回答の本文や NUL 自体は載せない） */
+const NUL_OUTPUT_DETAIL = "回答の文字列に NUL 文字が含まれています";
+
 /** 費用（100万分の1ドル単位）。浮動小数点を使わず整数で計算し、端数は切り上げる */
 export function costUsdMicros(u: Omit<AiUsage, "costUsdMicros">): number {
   const p = JOURNAL_MODEL_PRICE_MICROS_PER_MTOK;
@@ -76,6 +79,11 @@ export function claudeJournalAi(client: Anthropic = new Anthropic()): JournalAi 
     const parsed = aiJournalOutputSchema.safeParse(json);
     if (!parsed.success) {
       return { status: "invalid", ...common, detail: parsed.error.message };
+    }
+    // PostgreSQL は NUL を保存できず、判断ログの記録で失敗するため、記録の前に担当者へ回す
+    const { description, reason, unknowns } = parsed.data;
+    if ([description, reason, ...unknowns].some((s) => s.includes("\u0000"))) {
+      return { status: "invalid", ...common, detail: NUL_OUTPUT_DETAIL };
     }
     return { status: "ok", ...common, output: parsed.data };
   };

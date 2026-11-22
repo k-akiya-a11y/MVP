@@ -174,16 +174,19 @@ describe("悪意のある文面のメモがあっても", () => {
 
   it("ジョブは判断ログの記録だけを行い、承認・外部書込の操作は存在せず、メモの版が監査に残る", async () => {
     const recorded: Array<ReturnType<typeof toAiDecisionRow>> = [];
+    const queue = [txn({ id: "a" })];
     const store: ProposalStore = {
-      listPendingTransactions: async () => [txn({ id: "a" })],
+      claimPendingBatch: async (limit) => queue.splice(0, limit),
+      confirmClaim: async () => true,
+      releaseClaims: async () => undefined,
       loadCustomerContext: async () => maliciousContext(),
       recordDecision: vi.fn(async (row: AiDecisionRow) => {
         recorded.push(row);
         return "d";
       }),
     };
-    // ストアが持つ操作は読込と判断ログの追記だけ（承認や freee・Gmail への書込の入口がない）
-    expect(Object.keys(store).sort()).toEqual(["listPendingTransactions", "loadCustomerContext", "recordDecision"]);
+    // ストアが持つ操作は読込・作業の貸出しの管理・判断ログの追記だけ（承認や freee・Gmail への書込の入口がない）
+    expect(Object.keys(store).sort()).toEqual(["claimPendingBatch", "confirmClaim", "loadCustomerContext", "recordDecision", "releaseClaims"]);
 
     const result = await runProposalJob({ store, ai: mockAi(), today: "2026-10-31" });
     expect(result.processed).toBe(1);

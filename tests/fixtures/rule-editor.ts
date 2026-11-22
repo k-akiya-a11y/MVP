@@ -40,7 +40,7 @@ export function fakeClient(handler: (c: Call) => Reply | Promise<Reply>, opts: {
       const call: Call = { table, ops: [] };
       calls.push(call);
       const builder: Record<string, unknown> = {};
-      for (const op of ["select", "eq", "in", "gte", "order", "range", "limit", "insert", "update", "delete", "upsert"]) {
+      for (const op of ["select", "eq", "in", "gte", "lte", "order", "range", "limit", "insert", "update", "delete", "upsert"]) {
         builder[op] = (...args: unknown[]) => {
           call.ops.push({ op, args });
           return builder;
