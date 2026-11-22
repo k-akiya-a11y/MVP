@@ -6,6 +6,7 @@ import { bulkApprovalTargets } from "@/lib/review/selection";
 import { trimReason } from "@/lib/review/submit";
 import { bulkApproveAction, reviewAction } from "./actions";
 
+type WriteGuard = "idle" | "pending" | "unknown";
 type Tab = "high" | "medium" | "low" | "on_hold";
 const TABS: { id: Tab; label: string }[] = [
   { id: "high", label: "高（まとめて承認）" },
@@ -28,9 +29,24 @@ function inTab(item: ReviewItem, tab: Tab) {
   return tab === "on_hold" ? item.txn.status === "on_hold" : item.txn.status === "proposed" && item.confidence === tab;
 }
 
-const emptyEntry = (): EntryJson => ({
+/** 修正フォームの下書き。tax_code の null は未選択、0 はマスタにあれば正当な値（合成例では SYNTH-TAX-ZERO。freee 実環境の分類は未確認）、負数は不正。送るときは finalEntryOf で EntryJson にする */
+type EntryDraft = Omit<EntryJson, "tax_code"> & { tax_code: number | null };
+
+/**
+ * 下書きを確定内容にする。保存できない下書き（勘定科目が未選択、税区分が未選択、
+ * 税区分が安全な整数でない、税区分がマスタにない）は null。税区分は 0 を含めてマスタにあるものだけ通す
+ * （0 を特別扱いしない）。null や 0 に丸めた値は作らない。
+ */
+function finalEntryOf(draft: EntryDraft, masters: ReviewQueue["masters"]): EntryJson | null {
+  const { tax_code } = draft;
+  if (draft.account_item_id <= 0 || tax_code === null) return null;
+  if (!Number.isSafeInteger(tax_code) || tax_code < 0 || !masters.tax.some((m) => m.id === tax_code)) return null;
+  return { ...draft, tax_code };
+}
+
+const emptyEntry = (): EntryDraft => ({
   account_item_id: 0,
-  tax_code: 0,
+  tax_code: null,
   partner_id: null,
   item_id: null,
   section_id: null,
@@ -58,10 +74,18 @@ export function ReviewBoard({
   const [tab, setTab] = useState<Tab>("high");
   const [index, setIndex] = useState(0);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [editing, setEditing] = useState<EntryJson | null>(null);
+  const [editing, setEditing] = useState<EntryDraft | null>(null);
   const [reason, setReason] = useState("");
   const [message, setMessage] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  // 書込みの同期ガード。判定は ref だけで行い（古いハンドラやキー連打も同じ値を見る）、state は表示（無効化）の写し。
+  // unknown（結果不明）は再マウント（実際の再読み込み）でだけ解ける。props やタブの変化では触らない
+  const guard = useRef<WriteGuard>("idle");
+  const [lock, setLock] = useState<WriteGuard>("idle");
+  const busy = lock !== "idle";
+  const setGuard = useCallback((next: WriteGuard) => {
+    guard.current = next;
+    setLock(next);
+  }, []);
   const shownAt = useRef(Date.now());
   const tabShownAt = useRef(Date.now());
 
@@ -100,14 +124,16 @@ export function ReviewBoard({
 
   const act = useCallback(
     async (action: "approve" | "correct" | "hold" | "reject", entry: EntryJson | null = null) => {
-      if (!current || busy) return;
+      if (!current || guard.current !== "idle") return;
       if (action !== "hold" && !canApprove) return;
       // 保留は引継ぎなので理由を必須にする（DB でも拒否する）
       if (action === "hold" && trimReason(reason) === "") {
         setMessage("保留の理由を入力してください");
         return;
       }
-      setBusy(true);
+      // 検証のあと、最初の await の前に同期で取得する
+      setGuard("pending");
+      let next: WriteGuard = "idle";
       setMessage(null);
       // 確認した明細は、結果にかかわらずまとめて承認の選択から外す（保留した明細が混ざらないように）
       const decided = current.decisionId;
@@ -129,17 +155,20 @@ export function ReviewBoard({
         setMessage(result.ok ? null : result.error);
       } catch {
         // 通信の失敗などで結果を受け取れなかった。確認の記録は済んでいるかもしれないので、成否を断定しない
+        next = "unknown";
         setMessage(REVIEW_UNKNOWN_MESSAGE);
       } finally {
-        setBusy(false);
+        // 確定した結果（成功・既知の拒否）だけ解く。結果不明は据え置く
+        setGuard(next);
       }
     },
-    [busy, canApprove, current, customerId, reason],
+    [canApprove, current, customerId, reason, setGuard],
   );
 
   const bulkApprove = useCallback(async () => {
-    if (!canApprove || bulkTargets.length === 0 || busy) return;
-    setBusy(true);
+    if (!canApprove || bulkTargets.length === 0 || guard.current !== "idle") return;
+    setGuard("pending");
+    let next: WriteGuard = "idle";
     setMessage(null);
     try {
       // まとめて承認は一覧を見ていた時間を件数で割って1件あたりの秒数にする
@@ -159,16 +188,18 @@ export function ReviewBoard({
       // 結果を受け取れなかった。一部またはすべてが承認済みかもしれないので、同じ選択をそのまま送り直さないよう選択を外す
       setSelected(new Set());
       tabShownAt.current = Date.now();
+      next = "unknown";
       setMessage(BULK_UNKNOWN_MESSAGE);
     } finally {
-      setBusy(false);
+      setGuard(next);
     }
-  }, [bulkTargets, busy, canApprove, customerId]);
+  }, [bulkTargets, canApprove, customerId, setGuard]);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       const target = e.target as HTMLElement;
-      if (editing || ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName)) return;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat || e.isComposing || e.defaultPrevented) return;
+      if (editing || target.isContentEditable || ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName)) return;
       if (e.key === "j") setIndex((i) => Math.min(i + 1, visible.length - 1));
       else if (e.key === "k") setIndex((i) => Math.max(i - 1, 0));
       else if (e.key === "A" && e.shiftKey && tab === "high" && canApprove) void bulkApprove();
@@ -278,7 +309,10 @@ export function ReviewBoard({
                 onReason={setReason}
                 onChange={setEditing}
                 onCancel={() => setEditing(null)}
-                onSave={() => void act("correct", editing)}
+                onSave={() => {
+                  const finalEntry = finalEntryOf(editing, masters);
+                  if (finalEntry) void act("correct", finalEntry);
+                }}
                 busy={busy}
               />
             ) : (
@@ -450,16 +484,16 @@ function EntryEditor({
   onSave,
   busy,
 }: {
-  entry: EntryJson;
+  entry: EntryDraft;
   masters: ReviewQueue["masters"];
   reason: string;
   onReason: (v: string) => void;
-  onChange: (e: EntryJson) => void;
+  onChange: (e: EntryDraft) => void;
   onCancel: () => void;
   onSave: () => void;
   busy: boolean;
 }) {
-  const valid = entry.account_item_id > 0 && entry.tax_code > 0;
+  const valid = finalEntryOf(entry, masters) !== null;
   return (
     <form
       className="editor"
@@ -468,6 +502,8 @@ function EntryEditor({
         if (valid) onSave();
       }}
       onKeyDown={(e) => {
+        // IME 変換中・長押し・他で処理済みのキーは、取消も保存も起動しない
+        if (e.nativeEvent?.isComposing || e.repeat || e.defaultPrevented) return;
         if (e.key === "Escape") onCancel();
         if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && valid) onSave();
       }}
@@ -483,8 +519,8 @@ function EntryEditor({
         label="税区分"
         required
         options={masters.tax}
-        value={entry.tax_code || null}
-        onChange={(v) => onChange({ ...entry, tax_code: v ?? 0 })}
+        value={entry.tax_code}
+        onChange={(v) => onChange({ ...entry, tax_code: v })}
       />
       <MasterSelect label="取引先" options={masters.partner} value={entry.partner_id} onChange={(v) => onChange({ ...entry, partner_id: v })} />
       <MasterSelect label="品目" options={masters.item} value={entry.item_id} onChange={(v) => onChange({ ...entry, item_id: v })} />
