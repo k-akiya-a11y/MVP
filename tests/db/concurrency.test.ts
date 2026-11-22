@@ -430,6 +430,218 @@ describe("同時取込（2セッション）", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// 取込の再試行・並行の回帰（docs/reviews/2026-11-05-import-retry-concurrency.md）
+
+async function importsOf(admin: Session, fileLike: string) {
+  const res = await admin.client.query<{
+    id: string;
+    file_name: string;
+    status: string;
+    row_count: number;
+    inserted_count: number;
+    skipped_duplicate_count: number;
+    suspected_duplicate_count: number;
+    income_total: string;
+    expense_total: string;
+    inserted_amount_total: string;
+    skipped_amount_total: string;
+    suspected_amount_total: string;
+    batch_hash: string;
+  }>(
+    `select id, file_name, status, row_count, inserted_count, skipped_duplicate_count, suspected_duplicate_count,
+            income_total, expense_total, inserted_amount_total, skipped_amount_total, suspected_amount_total, batch_hash
+     from public.statement_imports where file_name like $1 order by imported_at, id`,
+    [fileLike],
+  );
+  return res.rows;
+}
+
+const sumAmounts = (txns: { amount: string }[]) => txns.reduce((sum, t) => sum + Number(t.amount), 0);
+
+describe("取込の再試行・並行の回帰（2セッション）", () => {
+  it(
+    "確定済みの取込の応答を失った（模擬）後、別セッションからの再試行は明細を増やさず、元の明細・件数・金額のまま再実行として読み飛ばす",
+    async () => {
+      // 注意: 「応答の消失」は、返り値を使わず元の接続を閉じることによる模擬である。実際の HTTP・ブラウザ・ネットワーク断の再現ではない
+      const tag = uniqueTag();
+      const file = `${tag}-upload.csv`;
+      const rows: ImportRow[] = [
+        { txn_date: "2026-10-27", amount: 9020, direction: "expense", description: "SAMPLE TELECOM", balance: 90980, dedupe_key: `${tag}-r1` },
+        { txn_date: "2026-10-31", amount: 330000, direction: "income", description: "SAMPLE CLIENT", balance: 420980, dedupe_key: `${tag}-r2` },
+      ];
+      await withSessions(async (admin, open) => {
+        const original = await open("conc-lost-original");
+        await inTx(original.client, "staff", () => importSql(original.client, file, rows)); // 返り値は捨てる（消失した応答）
+        await original.client.end(); // 元の接続も閉じる
+
+        // 元の取込は確定している（応答を見ていなくても、DB には残っている）。ID は応答ではなく DB から読む
+        const beforeTxns = await txnsOf(admin, tag);
+        const beforeImports = await importsOf(admin, file);
+        expect(beforeTxns.map((t) => t.dedupe_key)).toEqual([`${tag}-r1`, `${tag}-r2`]);
+        expect(beforeImports).toHaveLength(1);
+        const originalImport = beforeImports[0]!;
+        expect(originalImport).toMatchObject({ status: "completed", row_count: 2, inserted_count: 2, skipped_duplicate_count: 0, suspected_duplicate_count: 0 });
+        expect(beforeTxns.every((t) => t.status === "new" && t.import_id === originalImport.id)).toBe(true);
+
+        // 独立した新しいセッションからの再試行
+        const retry = await open("conc-lost-retry");
+        const result = (await inTx(retry.client, "staff", () => importSql(retry.client, file, rows))).rows[0]!;
+        expect(result.import_id).not.toBe(originalImport.id);
+        expect(result).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 2, suspected_duplicate_count: 0 });
+        expect(Number(result.income_total)).toBe(330000);
+        expect(Number(result.expense_total)).toBe(9020);
+        expect(Number(result.inserted_amount_total)).toBe(0);
+        expect(Number(result.skipped_amount_total)).toBe(330000 + 9020);
+        expect(Number(result.suspected_amount_total)).toBe(0);
+
+        // 明細は元のまま（ID・取込ID・キー・状態・金額が完全に同じ）。再試行の取込IDを持つ明細はない
+        const afterTxns = await txnsOf(admin, tag);
+        expect(afterTxns).toEqual(beforeTxns);
+        expect(afterTxns.some((t) => t.import_id === result.import_id)).toBe(false);
+        expect(sumAmounts(afterTxns)).toBe(330000 + 9020);
+
+        // 取込記録は元と再試行の2件。元の記録は変わらず、同じ内容のハッシュ、各記録で 読めた行 = 登録 + 読み飛ばし + 重複の疑い
+        const afterImports = await importsOf(admin, file);
+        expect(afterImports).toHaveLength(2);
+        expect(afterImports.find((i) => i.id === originalImport.id)).toEqual(originalImport);
+        const retried = afterImports.find((i) => i.id === result.import_id)!;
+        expect(retried).toMatchObject({ status: "completed", row_count: 2, inserted_count: 0, skipped_duplicate_count: 2, suspected_duplicate_count: 0 });
+        expect(retried.batch_hash).toBe(originalImport.batch_hash);
+        for (const rec of afterImports) {
+          expect(rec.inserted_count + rec.skipped_duplicate_count + rec.suspected_duplicate_count).toBe(rec.row_count);
+        }
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "先の取込がロールバックすると、顧客単位のロックを待っていた同じ内容の取込が1回だけ登録され、取り消された取込・明細・記録は残らず、金額が合う",
+    async () => {
+      const tag = uniqueTag();
+      const file = `${tag}-upload.csv`;
+      const rows: ImportRow[] = [
+        { txn_date: "2026-10-27", amount: 9020, direction: "expense", description: "SAMPLE TELECOM", balance: 90980, dedupe_key: `${tag}-b1` },
+        { txn_date: "2026-10-31", amount: 330000, direction: "income", description: "SAMPLE CLIENT", balance: 420980, dedupe_key: `${tag}-b2` },
+      ];
+      await withSessions(async (admin, open) => {
+        const a = await open("conc-abort-a");
+        const b = await open("conc-abort-b");
+
+        await begin(a.client, "staff");
+        const aborted = (await importSql(a.client, file, rows)).rows[0]!; // 未確定のまま保持
+        expect(aborted.inserted_count).toBe(2);
+
+        await begin(b.client, "staff");
+        const second = track(importSql(b.client, file, rows));
+        expect(await waitUntilBlocked(admin, b, a, second, "同じ内容の取込（先がロールバックする）")).toBe("advisory");
+
+        await rollbackQuietly(a.client);
+        const outcome = await within(second.outcome, "waiting import after rollback");
+        if (!outcome.ok) throw outcome.error;
+        await commit(b.client);
+
+        const result = outcome.value.rows[0]!;
+        expect(result.import_id).not.toBe(aborted.import_id);
+        expect(result).toMatchObject({ inserted_count: 2, skipped_duplicate_count: 0, suspected_duplicate_count: 0 });
+        expect(Number(result.inserted_amount_total)).toBe(330000 + 9020);
+        expect(Number(result.skipped_amount_total)).toBe(0);
+        expect(Number(result.suspected_amount_total)).toBe(0);
+
+        // 明細は待っていた取込の2件だけ（1回だけ登録）。金額 = 入金 + 出金 = 登録金額
+        const txns = await txnsOf(admin, tag);
+        expect(txns.map((t) => t.dedupe_key)).toEqual([`${tag}-b1`, `${tag}-b2`]);
+        expect(txns.every((t) => t.status === "new" && t.import_id === result.import_id && t.duplicate_of_id === null)).toBe(true);
+        expect(sumAmounts(txns)).toBe(Number(result.income_total) + Number(result.expense_total));
+        expect(sumAmounts(txns)).toBe(Number(result.inserted_amount_total));
+
+        // 取り消された取込の記録・明細は残っていない。この内容の取込記録は待っていた取込の1件だけ
+        const abortedRecord = await admin.client.query("select 1 from public.statement_imports where id = $1", [aborted.import_id]);
+        expect(abortedRecord.rowCount).toBe(0);
+        const abortedTxns = await admin.client.query("select 1 from public.bank_transactions where import_id = $1", [aborted.import_id]);
+        expect(abortedTxns.rowCount).toBe(0);
+        const imports = await importsOf(admin, file);
+        expect(imports.map((i) => i.id)).toEqual([result.import_id]);
+        expect(imports[0]!.inserted_count + imports[0]!.skipped_duplicate_count + imports[0]!.suspected_duplicate_count).toBe(imports[0]!.row_count);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "残高のない同一内容の取込が同時に来ても、直列化され、後の取込は読み飛ばさず・通常の新規にもせず、元の明細を指す「重複の疑い」として残し、件数・金額が合う",
+    async () => {
+      const tag = uniqueTag();
+      const file = `${tag}-upload.csv`;
+      const rows: ImportRow[] = [
+        { txn_date: "2026-10-27", amount: 1200, direction: "expense", description: "SAMPLE STATIONERY", balance: null, dedupe_key: `${tag}-n1` },
+        { txn_date: "2026-10-28", amount: 5000, direction: "income", description: "SAMPLE REFUND", balance: null, dedupe_key: `${tag}-n2` },
+      ];
+      await withSessions(async (admin, open) => {
+        const a = await open("conc-nobalance-a");
+        const b = await open("conc-nobalance-b");
+
+        await begin(a.client, "staff");
+        const first = (await importSql(a.client, file, rows)).rows[0]!; // 未確定のまま保持
+        expect(first).toMatchObject({ inserted_count: 2, skipped_duplicate_count: 0, suspected_duplicate_count: 0 });
+
+        await begin(b.client, "staff");
+        const second = track(importSql(b.client, file, rows));
+        // 直列化: 後の取込は先の確定まで完了しない
+        expect(await waitUntilBlocked(admin, b, a, second, "残高なしの同一取込")).toBe("advisory");
+
+        await commit(a.client);
+        const outcome = await within(second.outcome, "second no-balance import");
+        if (!outcome.ok) throw outcome.error;
+        await commit(b.client);
+
+        const result = outcome.value.rows[0]!;
+        expect(result.import_id).not.toBe(first.import_id);
+        expect(result).toMatchObject({ inserted_count: 0, skipped_duplicate_count: 0, suspected_duplicate_count: 2 });
+        expect(Number(result.income_total)).toBe(5000);
+        expect(Number(result.expense_total)).toBe(1200);
+        expect(Number(result.inserted_amount_total)).toBe(0);
+        expect(Number(result.skipped_amount_total)).toBe(0);
+        expect(Number(result.suspected_amount_total)).toBe(1200 + 5000);
+
+        // 明細は4件: 元の2件（new）と、後の取込の「重複の疑い」2件（元の明細を指す）。黙って捨てていない
+        const txns = await txnsOf(admin, tag);
+        expect(txns).toHaveLength(4);
+        expect(sumAmounts(txns)).toBe(2 * (1200 + 5000));
+        const originals = txns.filter((t) => t.import_id === first.import_id);
+        const suspected = txns.filter((t) => t.import_id === result.import_id);
+        expect(originals.map((t) => t.dedupe_key)).toEqual([`${tag}-n1`, `${tag}-n2`]);
+        expect(originals.every((t) => t.status === "new" && t.duplicate_of_id === null)).toBe(true);
+        // 通常の新規明細として増えていない（後の取込の明細はすべて重複の疑い）
+        expect(txns.filter((t) => t.status === "new")).toHaveLength(2);
+        expect(suspected).toHaveLength(2);
+        for (const s of suspected) {
+          const key = s.dedupe_key.replace(`:suspected:${result.import_id}`, "");
+          const original = originals.find((o) => o.dedupe_key === key);
+          expect(original, `${s.dedupe_key} の元の明細`).toBeDefined();
+          expect(s).toMatchObject({ status: "duplicate_suspected", duplicate_of_id: original!.id });
+          expect(s.amount).toBe(original!.amount);
+        }
+
+        // 取込記録は2件。各記録で 読めた行 = 登録 + 読み飛ばし + 重複の疑い（件数・金額とも）
+        const imports = await importsOf(admin, file);
+        expect(imports.map((i) => i.id)).toEqual([first.import_id, result.import_id]);
+        expect(imports[0]).toMatchObject({ row_count: 2, inserted_count: 2, skipped_duplicate_count: 0, suspected_duplicate_count: 0 });
+        expect(imports[1]).toMatchObject({ row_count: 2, inserted_count: 0, skipped_duplicate_count: 0, suspected_duplicate_count: 2 });
+        expect(imports[0]!.batch_hash).toBe(imports[1]!.batch_hash);
+        for (const rec of imports) {
+          expect(rec.inserted_count + rec.skipped_duplicate_count + rec.suspected_duplicate_count).toBe(rec.row_count);
+          expect(Number(rec.inserted_amount_total) + Number(rec.skipped_amount_total) + Number(rec.suspected_amount_total)).toBe(
+            Number(rec.income_total) + Number(rec.expense_total),
+          );
+        }
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------------------------
 // AI判断の記録
 
 /**
@@ -619,6 +831,259 @@ describe("人の保留と遅れたAI保存（2セッション）", () => {
         }
         expect(await reviews()).toEqual(expectedReviews);
         expect(await decisionsOf(admin, txnId)).toEqual(decisions);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------------------------
+// 保留の重複防止（別タブ・別端末の模擬）（docs/reviews/2026-11-05-review-cross-tab.md）
+
+const ALREADY_ON_HOLD = /すでに保留/;
+const HOLD_SECONDS = 45;
+/** どの顧客にも割り当てのない担当者（合成）。seed の担当者はサンプル商事だけを担当する */
+const UNASSIGNED_STAFF_ID = "00000000-0000-4000-8000-0000000000a3";
+
+const holdSql = (client: Client, decisionId: string, seconds = HOLD_SECONDS) =>
+  client.query<{ id: string }>("select public.record_human_review($1, 'hold', null, $2, $3, false) as id", [decisionId, HOLD_REASON, seconds]);
+
+/** 候補作成済（proposed）の明細と、その判断ログを確定済みの状態で作る */
+async function createProposed(admin: Session, open: (label: string) => Promise<Session>, tag: string) {
+  const txnId = await createNewTxn(admin, tag);
+  const setup = await open(`conc-dup-setup-${tag}`);
+  const decisionId = await inTx(setup.client, "service", async () => (await recordSql(setup.client, txnId, 101)).rows[0]!.id);
+  expect(await statusOf(admin, txnId)).toBe("proposed");
+  return { txnId, decisionId };
+}
+
+async function reviewRowsOf(admin: Session, decisionId: string) {
+  return (
+    await admin.client.query<{ id: string; action: string; reason: string | null; reviewer_id: string; review_seconds: number; bulk: boolean }>(
+      "select id, action, reason, reviewer_id, review_seconds, bulk from public.human_reviews where ai_decision_id = $1 order by created_at, id",
+      [decisionId],
+    )
+  ).rows;
+}
+
+async function pastEntryCount(admin: Session, decisionId: string): Promise<number> {
+  return Number((await admin.client.query<{ n: string }>("select count(*) as n from public.past_journal_entries where ai_decision_id = $1", [decisionId])).rows[0]!.n);
+}
+
+const totalSeconds = (rows: { review_seconds: number }[]) => rows.reduce((sum, r) => sum + r.review_seconds, 0);
+
+/** 割り当てのない担当者を作る（使い捨て DB。自動コミットの admin セッションで作成） */
+async function ensureUnassignedStaff(admin: Session): Promise<void> {
+  await admin.client.query("insert into auth.users (id, email) values ($1, 'unassigned@example.com') on conflict (id) do nothing", [UNASSIGNED_STAFF_ID]);
+  await admin.client.query(
+    "insert into public.staff_members (user_id, email, display_name, role) values ($1, 'unassigned@example.com', '割当なし担当者（合成）', 'staff') on conflict (user_id) do nothing",
+    [UNASSIGNED_STAFF_ID],
+  );
+}
+
+async function beginAsUser(client: Client, userId: string): Promise<void> {
+  await client.query("begin");
+  await client.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
+  await client.query("set local role authenticated");
+}
+
+describe("保留の重複防止（別タブ・別端末の模擬、2セッション）", () => {
+  it(
+    "すでに保留中の候補への2回目の保留は、担当者・管理者のどちらでも拒否され、確認ログ・確認時間・状態・過去仕訳を変えない（順次）",
+    async () => {
+      const tag = uniqueTag();
+      await withSessions(async (admin, open) => {
+        const { txnId, decisionId } = await createProposed(admin, open, tag);
+        const tab1 = await open("conc-dup-seq-tab1");
+        const tab2 = await open("conc-dup-seq-tab2");
+        const approver = await open("conc-dup-seq-admin");
+
+        const firstId = await inTx(tab1.client, "staff", async () => (await holdSql(tab1.client, decisionId)).rows[0]!.id);
+        expect(await statusOf(admin, txnId)).toBe("on_hold");
+        const afterFirst = await reviewRowsOf(admin, decisionId);
+        expect(afterFirst).toEqual([{ id: firstId, action: "hold", reason: HOLD_REASON, reviewer_id: STAFF_ID, review_seconds: HOLD_SECONDS, bulk: false }]);
+
+        // 古い画面（別タブ）から、同じ候補への保留がもう一度届く
+        await expect(inTx(tab2.client, "staff", () => holdSql(tab2.client, decisionId))).rejects.toThrow(ALREADY_ON_HOLD);
+        // 管理者の保留も同じ（保留中の候補を、重ねて保留にしない）
+        await expect(inTx(approver.client, "admin", () => holdSql(approver.client, decisionId))).rejects.toThrow(ALREADY_ON_HOLD);
+
+        // 確認ログは最初の1行のまま（同じ ID・内容）、確認時間は1回分、状態は保留のまま、過去仕訳は作られない
+        expect(await reviewRowsOf(admin, decisionId)).toEqual(afterFirst);
+        expect(totalSeconds(await reviewRowsOf(admin, decisionId))).toBe(HOLD_SECONDS);
+        expect(await statusOf(admin, txnId)).toBe("on_hold");
+        expect(await pastEntryCount(admin, decisionId)).toBe(0);
+        expect(await decisionsOf(admin, txnId)).toHaveLength(1);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "先の保留が未確定の間に来た同じ候補への保留は、ロック待ちのあと拒否され、保留の確認ログと確認時間が1回分だけ残る（観測した2セッションの重なり）",
+    async () => {
+      const tag = uniqueTag();
+      await withSessions(async (admin, open) => {
+        const { txnId, decisionId } = await createProposed(admin, open, tag);
+        const a = await open("conc-dup-tab-a");
+        const b = await open("conc-dup-tab-b");
+
+        // タブ A の保留（未確定のまま保持）
+        await begin(a.client, "staff");
+        const firstId = (await holdSql(a.client, decisionId)).rows[0]!.id;
+        expect(await sessionState(admin, a)).toBe("idle in transaction");
+
+        // タブ B も、同じ「候補作成済」の候補への保留を送る。A の確定までロック待ちになることを観測する
+        await begin(b.client, "staff");
+        const second = track(holdSql(b.client, decisionId));
+        expect(["transactionid", "tuple"]).toContain(await waitUntilBlocked(admin, b, a, second, "別タブの同時の保留"));
+
+        await commit(a.client);
+        const outcome = await within(second.outcome, "second hold");
+        expect(outcome.ok, "後の保留は、先の確定後に拒否される").toBe(false);
+        if (outcome.ok) return;
+        expect(outcome.error.message).toMatch(ALREADY_ON_HOLD);
+        await rollbackQuietly(b.client);
+
+        const reviews = await reviewRowsOf(admin, decisionId);
+        expect(reviews).toEqual([{ id: firstId, action: "hold", reason: HOLD_REASON, reviewer_id: STAFF_ID, review_seconds: HOLD_SECONDS, bulk: false }]);
+        expect(totalSeconds(reviews)).toBe(HOLD_SECONDS);
+        expect(await statusOf(admin, txnId)).toBe("on_hold");
+        expect(await pastEntryCount(admin, decisionId)).toBe(0);
+        expect(await decisionsOf(admin, txnId)).toHaveLength(1);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "保留が拒否されたあとの再試行（確認時間を変えて）も拒否され、確認時間を増やさない",
+    async () => {
+      const tag = uniqueTag();
+      await withSessions(async (admin, open) => {
+        const { txnId, decisionId } = await createProposed(admin, open, tag);
+        const tab = await open("conc-dup-retry");
+
+        await inTx(tab.client, "staff", () => holdSql(tab.client, decisionId));
+        const afterFirst = await reviewRowsOf(admin, decisionId);
+        expect(totalSeconds(afterFirst)).toBe(HOLD_SECONDS);
+
+        // 拒否される保留を、確認時間を変えて繰り返し送っても、記録は増えない
+        for (const seconds of [HOLD_SECONDS, 30, 0]) {
+          await expect(inTx(tab.client, "staff", () => holdSql(tab.client, decisionId, seconds))).rejects.toThrow(ALREADY_ON_HOLD);
+        }
+
+        expect(await reviewRowsOf(admin, decisionId)).toEqual(afterFirst);
+        expect(totalSeconds(await reviewRowsOf(admin, decisionId))).toBe(HOLD_SECONDS);
+        expect(await statusOf(admin, txnId)).toBe("on_hold");
+        expect(await pastEntryCount(admin, decisionId)).toBe(0);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it.each([
+    { action: "approve" as const, finalEntry: null, status: "approved", pastEntries: 1 },
+    { action: "correct" as const, finalEntry: { account_item_id: 102, tax_code: 21 }, status: "approved", pastEntries: 1 },
+    { action: "reject" as const, finalEntry: null, status: "rejected", pastEntries: 0 },
+  ])(
+    "保留中の候補を管理者が $action で確定できる（保留はあとの確定をふさがず、保留の行は変わらない）",
+    async ({ action, finalEntry, status, pastEntries }) => {
+      const tag = uniqueTag();
+      await withSessions(async (admin, open) => {
+        const { txnId, decisionId } = await createProposed(admin, open, tag);
+        const tab = await open("conc-dup-release-staff");
+        const approver = await open("conc-dup-release-admin");
+
+        await inTx(tab.client, "staff", () => holdSql(tab.client, decisionId));
+        const heldRows = await reviewRowsOf(admin, decisionId);
+        expect(heldRows).toHaveLength(1);
+        expect(await statusOf(admin, txnId)).toBe("on_hold");
+
+        const resolvedId = await inTx(approver.client, "admin", async () =>
+          (
+            await approver.client.query<{ id: string }>("select public.record_human_review($1, $2, $3::jsonb, null, 20, false) as id", [
+              decisionId,
+              action,
+              finalEntry === null ? null : JSON.stringify(finalEntry),
+            ])
+          ).rows[0]!.id,
+        );
+
+        // 保留の行はそのまま、確定の行が1行追加される。確認時間は 保留 + 確定
+        const reviews = await reviewRowsOf(admin, decisionId);
+        expect(reviews).toHaveLength(2);
+        expect(reviews[0]).toEqual(heldRows[0]);
+        expect(reviews[1]).toMatchObject({ id: resolvedId, action, reviewer_id: ADMIN_ID, review_seconds: 20 });
+        expect(totalSeconds(reviews)).toBe(HOLD_SECONDS + 20);
+        expect(await statusOf(admin, txnId)).toBe(status);
+        expect(await pastEntryCount(admin, decisionId)).toBe(pastEntries);
+
+        // 確定後に、もう一度保留しても確認済みとして拒否され、何も増えない
+        await expect(inTx(tab.client, "staff", () => holdSql(tab.client, decisionId))).rejects.toThrow(/すでに確認済み/);
+        expect(await reviewRowsOf(admin, decisionId)).toEqual(reviews);
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "担当外の担当者は、候補作成済でも保留中でも保留・承認できず、状態を漏らす文言も返さず、確認ログと状態を変えない",
+    async () => {
+      const tag = uniqueTag();
+      await withSessions(async (admin, open) => {
+        await ensureUnassignedStaff(admin);
+        const proposed = await createProposed(admin, open, `${tag}p`);
+        const held = await createProposed(admin, open, `${tag}h`);
+        const owner = await open("conc-dup-auth-owner");
+        const outsider = await open("conc-dup-auth-outsider");
+
+        await inTx(owner.client, "staff", () => holdSql(owner.client, held.decisionId));
+        const heldRows = await reviewRowsOf(admin, held.decisionId);
+        expect(heldRows).toHaveLength(1);
+
+        for (const target of [proposed, held]) {
+          for (const sql of [
+            "select public.record_human_review($1, 'hold', null, '担当外からの保留', 10, false)",
+            "select public.record_human_review($1, 'approve', null, null, 10, false)",
+          ]) {
+            await beginAsUser(outsider.client, UNASSIGNED_STAFF_ID);
+            try {
+              const err = await outsider.client.query(sql, [target.decisionId]).then(
+                () => undefined,
+                (e: unknown) => (e instanceof Error ? e : new Error(String(e))),
+              );
+              expect(err, `担当外の呼出しは拒否される: ${sql}`).toBeDefined();
+              expect(err!.message).toMatch(/仕訳候補が見つかりません/);
+              expect(err!.message).not.toMatch(ALREADY_ON_HOLD);
+            } finally {
+              await rollbackQuietly(outsider.client);
+            }
+          }
+        }
+
+        // 候補作成済の明細は、確認ログなし・proposed のまま。保留中の明細は、最初の1行のまま
+        expect(await reviewRowsOf(admin, proposed.decisionId)).toEqual([]);
+        expect(await statusOf(admin, proposed.txnId)).toBe("proposed");
+        expect(await reviewRowsOf(admin, held.decisionId)).toEqual(heldRows);
+        expect(await statusOf(admin, held.txnId)).toBe("on_hold");
+        expect(await pastEntryCount(admin, proposed.decisionId)).toBe(0);
+        expect(await pastEntryCount(admin, held.decisionId)).toBe(0);
+
+        // 割り当てのある担当者は承認できない（管理者だけ）。承認の権限は広がっていない
+        await beginAsUser(owner.client, STAFF_ID);
+        try {
+          const err = await owner.client.query("select public.record_human_review($1, 'approve', null, null, 10, false)", [held.decisionId]).then(
+            () => undefined,
+            (e: unknown) => (e instanceof Error ? e : new Error(String(e))),
+          );
+          expect(err, "担当者の承認は拒否される").toBeDefined();
+          expect(err!.message).toContain("承認・修正・却下は承認者（管理者）だけが行えます。保留にして理由を残してください");
+        } finally {
+          await rollbackQuietly(owner.client);
+        }
+        expect(await reviewRowsOf(admin, held.decisionId)).toEqual(heldRows);
+        expect(await statusOf(admin, held.txnId)).toBe("on_hold");
       });
     },
     TEST_TIMEOUT_MS,
