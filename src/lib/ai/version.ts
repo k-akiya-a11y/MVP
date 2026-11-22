@@ -4,7 +4,7 @@
  * 判断ログには、この2つを必ず記録する。
  */
 export const JOURNAL_MODEL = "claude-sonnet-5-5";
-export const JOURNAL_PROMPT_VERSION = "journal-proposal/2026-10-22.1";
+export const JOURNAL_PROMPT_VERSION = "journal-proposal/2026-10-24.1";
 
 /** Claude Sonnet 5.5 の料金（100万トークンあたり、100万分の1ドル単位の整数）。2026-10 時点 */
 export const JOURNAL_MODEL_PRICE_MICROS_PER_MTOK = {

@@ -21,8 +21,8 @@ const WALLET_KIND_LABELS: Record<WalletKind, string> = { bank_account: "銀行",
 type ImportTarget = { customerId: string; walletId: string; fileName: string; formatId: string };
 
 /**
- * 取込の件数と金額（円）。skipped は残高まで一致した取込済みの行（読み飛ばし）、
- * suspected は取込済みの行と区別できず「重複の疑い」として確認に回した行。
+ * 取込の件数と金額（円）。skipped は取込全体が同じ内容の再実行だと DB が確かめた、残高のある取込済みの行（読み飛ばし）、
+ * suspected は取込済みの行と同じキーで、同一取引と言い切れず「重複の疑い」として確認に回した行。
  * 読めた行 = inserted + skipped + suspected が件数・金額の両方で成り立つ（DB の制約でも確かめる）。
  */
 export type ImportCounts = {
@@ -83,11 +83,26 @@ export async function importStatementCsv(
     return fail([{ line: 0, message: `文字コードを読めません（${format.encoding} を想定）` }], null);
   }
   const parsed = parseStatementCsv(text, format);
+  // 書式の誤り・読めない行が1つでもあれば、1件も登録せずファイル全体を失敗として記録する
   if (parsed.errors.length > 0) {
     return fail(parsed.errors, parsed.sourceRowCount);
   }
+  const sourceRowCount = parsed.sourceRowCount;
+  if (sourceRowCount === null) {
+    // 行数を数えられるのは書式の誤りがないときだけ。ここには来ない想定だが、来たら取り込まない
+    return fail([{ line: 0, message: "CSV の行数を数えられません" }], null);
+  }
   if (parsed.rows.length === 0) {
-    return fail([{ line: 0, message: "取引の行がありません" }], parsed.sourceRowCount);
+    return fail([{ line: 0, message: "取引の行がありません" }], sourceRowCount);
+  }
+  // 1行ごとには安全でも、合計が安全な整数を超えると、登録後に集計値を検証できなくなる。登録の前に、正確な整数（BigInt）で数えて拒否する
+  const maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+  let sum = 0n;
+  for (const row of parsed.rows) {
+    sum += BigInt(row.amount);
+    if (sum > maxSafe) {
+      return fail([{ line: row.line, message: "取込む行の金額の合計が大きすぎます（安全に集計できる範囲を超えています）" }], sourceRowCount);
+    }
   }
   const keys = buildDedupeKeys(target.walletId, parsed.rows);
   const rows: StatementImportRow[] = parsed.rows.map((row, i) => ({
@@ -102,7 +117,7 @@ export async function importStatementCsv(
     ...target,
     formatId: format.id,
     rows,
-    sourceRowCount: parsed.sourceRowCount,
+    sourceRowCount,
     ignored: parsed.ignored,
   });
   return { ok: true, ...result, ignoredCount: parsed.ignored.length };

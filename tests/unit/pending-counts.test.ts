@@ -28,6 +28,10 @@ describe("loadPendingCounts", () => {
     expect(counts.get("c1", "on_hold")).toBe(0);
   });
 
+  it("data: null かつ error なしの応答も 0 件として返さず、例外にする", async () => {
+    await expect(loadPendingCounts(fakeClient({ data: null, error: null }))).rejects.toThrow(/件数の読込に失敗しました/);
+  });
+
   it("読込に失敗したら 0 件として返さず、例外にする", async () => {
     await expect(loadPendingCounts(fakeClient({ data: null, error: { message: "permission denied" } }))).rejects.toThrow(
       /件数の読込に失敗しました/,

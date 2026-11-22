@@ -3,7 +3,16 @@ import { z } from "zod";
 import { fetchAll } from "../supabase/fetch-all";
 import type { MasterKind } from "../proposals/types";
 
-const int = z.coerce.number().int();
+/**
+ * DB の応答の整数。数値は安全な整数だけ、文字列は 10 進の整数（符号は "-" のみ、空白・指数・16進・小数は不可）だけを通す。
+ * null・空文字・真偽値・配列は 0 / 1 に変換せず拒否する。"-0" は 0 にする。
+ * ID が正であるべきか等の値域は見ない（tax_code の 0 や過去仕訳の負の金額は正当）。
+ */
+const int = z
+  .union([z.number(), z.string().regex(/^-?[0-9]+$/)])
+  .transform(Number)
+  .pipe(z.number().refine((n) => Number.isSafeInteger(n)))
+  .transform((n) => (n === 0 ? 0 : n));
 
 const entrySchema = z.object({
   account_item_id: int,
@@ -80,6 +89,17 @@ export type ReviewQueue = {
   wallets: { id: string; name: string; kind: string }[];
 };
 
+/**
+ * 必須の関連行（最新の判断・重複元）が全件読込後も揃わないときの失敗。
+ * 利用者に出てもよい固定の文言だけを持ち、ID・顧客・DB の応答は含めない。
+ */
+export class ReviewQueueLoadError extends Error {
+  constructor() {
+    super("承認画面のデータを読み込めませんでした。時間をおいて再読み込みしてください。");
+    this.name = "ReviewQueueLoadError";
+  }
+}
+
 function ok<T>(res: { data: T | null; error: { message: string } | null }, what: string): T {
   if (res.error) throw new Error(`${what}の読込に失敗しました: ${res.error.message}`);
   return res.data as T;
@@ -155,91 +175,103 @@ export async function loadReviewQueue(client: SupabaseClient, customerId: string
     masters[m.kind].push({ id: m.freee_id, name: m.name });
   }
 
+  // 以降の関連行は、ID を 200 件ずつに分け、各チャンクを一意な order 付きで fetchAll する。
+  // サーバーの応答上限（max-rows）が 200 や 1,000 を下回っても、保留のような 1 対多の行が切れない。
   const decisions = (
-    await inChunks(txns.map((t) => t.id), async (ids) =>
-      z
-          .array(
-            z.object({
-              id: z.string(),
-              bank_transaction_id: z.string(),
-              created_at: z.string(),
-              confidence: z.enum(["high", "medium", "low"]),
-              proposal: entrySchema.nullable(),
-              confidence_breakdown: breakdownSchema,
-              past_entry_ids: z.array(z.string()),
-              ai_reason: z.string().nullable(),
-              ai_unknowns: z.array(z.string()),
-              model: z.string().nullable(),
-            }),
-          )
-          .parse(
-            ok(
-              await client
-                .from("latest_ai_decisions")
-                .select("id, bank_transaction_id, created_at, confidence, proposal, confidence_breakdown, past_entry_ids, ai_reason, ai_unknowns, model")
-                .in("bank_transaction_id", ids),
-              "仕訳候補",
-            ),
-          ),
+    await inChunks(txns.map((t) => t.id), (ids) =>
+      fetchAll("仕訳候補", (from, to) =>
+        client
+          .from("latest_ai_decisions")
+          .select("id, bank_transaction_id, created_at, confidence, proposal, confidence_breakdown, past_entry_ids, ai_reason, ai_unknowns, model")
+          .eq("customer_id", customerId)
+          .in("bank_transaction_id", ids)
+          .order("bank_transaction_id")
+          .order("id")
+          .range(from, to),
+      ),
     )
-  ).flat();
+  ).flatMap((rows) =>
+    z
+      .array(
+        z.object({
+          id: z.string(),
+          bank_transaction_id: z.string(),
+          created_at: z.string(),
+          confidence: z.enum(["high", "medium", "low"]),
+          proposal: entrySchema.nullable(),
+          confidence_breakdown: breakdownSchema,
+          past_entry_ids: z.array(z.string()),
+          ai_reason: z.string().nullable(),
+          ai_unknowns: z.array(z.string()),
+          model: z.string().nullable(),
+        }),
+      )
+      .parse(rows),
+  );
   const decisionByTxn = new Map(decisions.map((d) => [d.bank_transaction_id, d]));
+  // view は明細ごとに 1 件のはず。重複していたらどちらが最新か決められないので止める
+  if (decisionByTxn.size !== decisions.length) throw new ReviewQueueLoadError();
 
   const pastIds = [...new Set(decisions.flatMap((d) => d.past_entry_ids))];
   const pastRows = (
-    await inChunks(pastIds, async (ids) =>
-      z
-          .array(
-            z.object({
-              id: z.string(),
-              entry_date: z.string(),
-              amount: int,
-              bank_description: z.string().nullable(),
-              ...entrySchema.shape,
-              description: z.string().nullable(),
-            }),
-          )
-          .parse(
-            ok(
-              await client
-                .from("past_journal_entries")
-                .select("id, entry_date, amount, bank_description, account_item_id, tax_code, partner_id, item_id, section_id, tag_ids, description")
-                .in("id", ids),
-              "過去仕訳",
-            ),
-          ),
+    await inChunks(pastIds, (ids) =>
+      fetchAll("過去仕訳", (from, to) =>
+        client
+          .from("past_journal_entries")
+          .select("id, entry_date, amount, bank_description, account_item_id, tax_code, partner_id, item_id, section_id, tag_ids, description")
+          .eq("customer_id", customerId)
+          .in("id", ids)
+          .order("id")
+          .range(from, to),
+      ),
     )
-  ).flat();
+  ).flatMap((rows) =>
+    z
+      .array(
+        z.object({
+          id: z.string(),
+          entry_date: z.string(),
+          amount: int,
+          bank_description: z.string().nullable(),
+          ...entrySchema.shape,
+          description: z.string().nullable(),
+        }),
+      )
+      .parse(rows),
+  );
   const pastById = new Map(pastRows.map((p) => [p.id, p]));
 
+  // 保留は 1 つの判断に何件も付く。判断ごとに同じチャンクへ入るので、created_at → id の順が判断内で保たれる
   const holdRows = (
-    await inChunks(decisions.map((d) => d.id), async (ids) =>
-      z
-        .array(z.object({ ai_decision_id: z.string(), reason: z.string().nullable(), reviewer_id: z.string(), created_at: z.string() }))
-        .parse(
-          ok(
-            await client
-              .from("human_reviews")
-              .select("ai_decision_id, reason, reviewer_id, created_at")
-              .eq("action", "hold")
-              .in("ai_decision_id", ids)
-              .order("created_at"),
-            "保留の記録",
-          ),
-        ),
+    await inChunks(decisions.map((d) => d.id), (ids) =>
+      fetchAll("保留の記録", (from, to) =>
+        client
+          .from("human_reviews")
+          .select("ai_decision_id, reason, reviewer_id, created_at")
+          .eq("customer_id", customerId)
+          .eq("action", "hold")
+          .in("ai_decision_id", ids)
+          .order("created_at")
+          .order("id")
+          .range(from, to),
+      ),
     )
-  ).flat();
-  // 担当者は自分以外の名前を読めない（RLS）ので、読めない人は「担当者」と表示する
+  ).flatMap((rows) =>
+    z
+      .array(z.object({ ai_decision_id: z.string(), reason: z.string().nullable(), reviewer_id: z.string(), created_at: z.string() }))
+      .parse(rows),
+  );
+  // 担当者は自分以外の名前を読めない（RLS）ので、読めない人は「担当者」と表示する。staff_members は顧客を持たない
   const reviewerIds = [...new Set(holdRows.map((h) => h.reviewer_id))];
   const reviewerNames = new Map(
     (
-      await inChunks(reviewerIds, async (ids) =>
-        z
-          .array(z.object({ user_id: z.string(), display_name: z.string() }))
-          .parse(ok(await client.from("staff_members").select("user_id, display_name").in("user_id", ids), "担当者")),
+      await inChunks(reviewerIds, (ids) =>
+        fetchAll("担当者", (from, to) =>
+          client.from("staff_members").select("user_id, display_name").in("user_id", ids).order("user_id").range(from, to),
+        ),
       )
     )
-      .flat()
+      .flatMap((rows) => z.array(z.object({ user_id: z.string(), display_name: z.string() })).parse(rows))
       .map((s) => [s.user_id, s.display_name] as const),
   );
   const holdsByDecision = new Map<string, ReviewItem["holds"]>();
@@ -252,7 +284,8 @@ export async function loadReviewQueue(client: SupabaseClient, customerId: string
   const items: ReviewItem[] = [];
   for (const t of txns) {
     const d = decisionByTxn.get(t.id);
-    if (!d) continue;
+    // 候補作成済・保留の明細には必ず最新の判断がある。全件読んでも無いなら、キューを黙って縮めず読込失敗にする
+    if (!d) throw new ReviewQueueLoadError();
     const b = d.confidence_breakdown;
     items.push({
       decisionId: d.id,
@@ -317,18 +350,27 @@ export async function loadReviewQueue(client: SupabaseClient, customerId: string
     .parse(suspectsRes);
   const originals = new Map(
     (
-      await inChunks([...new Set(suspects.map((r) => r.duplicate_of_id))], async (ids) =>
-        z
-          .array(z.object({ id: z.string(), txn_date: z.string(), amount: int, description: z.string(), status: z.string() }))
-          .parse(ok(await client.from("bank_transactions").select("id, txn_date, amount, description, status").in("id", ids), "取込済みの明細")),
+      await inChunks([...new Set(suspects.map((r) => r.duplicate_of_id))], (ids) =>
+        fetchAll("取込済みの明細", (from, to) =>
+          client
+            .from("bank_transactions")
+            .select("id, txn_date, amount, description, status")
+            .eq("customer_id", customerId)
+            .in("id", ids)
+            .order("id")
+            .range(from, to),
+        ),
       )
     )
-      .flat()
+      .flatMap((rows) =>
+        z.array(z.object({ id: z.string(), txn_date: z.string(), amount: int, description: z.string(), status: z.string() })).parse(rows),
+      )
       .map((o) => [o.id, o] as const),
   );
   const suspectedDuplicates: SuspectedDuplicate[] = suspects.flatMap((r) => {
     const o = originals.get(r.duplicate_of_id);
-    if (!o) return [];
+    // 重複元は同じ顧客に必ずある（外部キー）。全件読んでも無いなら、未処理の疑いを隠さず読込失敗にする
+    if (!o) throw new ReviewQueueLoadError();
     return [
       {
         id: r.id,
@@ -352,7 +394,7 @@ export async function loadReviewQueue(client: SupabaseClient, customerId: string
   };
 }
 
-/** .in() に渡す ID が多いと URL が長くなりすぎるので、分けて問い合わせる */
+/** .in() に渡す ID が多いと URL が長くなりすぎるので、200 件ずつ分けて問い合わせる。各チャンクは fetchAll で全行を読むこと */
 async function inChunks<T>(ids: readonly string[], fn: (chunk: string[]) => Promise<T[]>): Promise<T[][]> {
   const results: T[][] = [];
   for (let i = 0; i < ids.length; i += 200) results.push(await fn(ids.slice(i, i + 200)));

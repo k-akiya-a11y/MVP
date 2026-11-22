@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import type { AiDecisionRow } from "../audit/decision-log";
@@ -5,16 +6,41 @@ import { fetchAll } from "../supabase/fetch-all";
 import type { CustomerContext } from "./propose";
 import type { BankTransaction, MasterEntry, PastEntry, RuleVersion } from "./types";
 
+/**
+ * 明細の作業の貸出し（リース）の期間（秒）。Vercel の関数の最大実行時間（cron ルートの maxDuration = 300 秒）より長くする。
+ * 生きている実行は最大実行時間を超えて続かないので、期限が切れた貸出しの持ち主はもう動いていない。
+ */
+export const CLAIM_LEASE_SECONDS = 600;
+
 /** 仕訳候補の作成で使う DB 操作。テストではモックに差し替える */
 export type ProposalStore = {
-  listPendingTransactions(limit: number): Promise<BankTransaction[]>;
+  /**
+   * 未判定（new）の明細を、DB に持つ走査位置から (txn_date, id) の昇順で最大 limit 件受け取り、位置を進める。
+   * 受け取った明細は、このストア（1 回の実行）の所有者として貸し出され、期限内は他の実行に渡らない。
+   * 位置の読取・選択・貸出し・更新は DB の 1 トランザクション（claim_pending_proposal_batch）で行うので、
+   * 並行する実行とは重ならず、位置は後戻りしない。末尾に届くと位置は先頭に戻り、失敗して new のまま残った明細を再び調べる。
+   * 位置はこの関数の外（メモリなど）に持たない。
+   * ジョブ（runProposalJob）は limit = 1 で判定の直前に呼ぶ。位置は借りた明細の分だけ進むので、判定を始めなかった明細を飛ばさない。
+   */
+  claimPendingBatch(limit: number): Promise<BankTransaction[]>;
+  /** AI を呼ぶ直前に、明細がまだ自分の貸出しか確かめて期限を延ばす。奪われていれば false（その明細に AI を呼ばない） */
+  confirmClaim(bankTransactionId: string): Promise<boolean>;
+  /** 失敗・中止・未着手の明細の貸出しを返す（自分の貸出しだけ）。明細は new のまま残り、次の巡回で再び調べられる */
+  releaseClaims(bankTransactionIds: string[]): Promise<void>;
   loadCustomerContext(customerId: string, onDate: string): Promise<CustomerContext>;
+  /** 貸出しの所有者として判断を記録し、貸出しを終える。所有者でなければ（期限切れで奪われた後など）拒否される */
   recordDecision(row: AiDecisionRow): Promise<string>;
 };
 
 const direction = z.enum(["income", "expense"]);
-// bigint 列は supabase-js では number で返る（freee の ID・金額は Number.MAX_SAFE_INTEGER に収まる）
-const int = z.coerce.number().int();
+// bigint 列は supabase-js では number で返る（freee の ID・金額は Number.MAX_SAFE_INTEGER に収まる）。
+// 数値は安全な整数だけ、文字列は 10 進の整数（符号は "-" のみ、空白・指数・16進・小数は不可）だけを通す。
+// z.coerce は null・空文字・真偽値・配列を 0 / 1 に変換してしまうため使わない。"-0" は 0 にする。
+const int = z
+  .union([z.number(), z.string().regex(/^-?[0-9]+$/)])
+  .transform(Number)
+  .pipe(z.number().refine((n) => Number.isSafeInteger(n)))
+  .transform((n) => (n === 0 ? 0 : n));
 const nullableInt = int.nullable();
 
 const txnRow = z.object({
@@ -69,7 +95,12 @@ const masterRow = z.object({
   kind: z.enum(["account_item", "partner", "item", "section", "tag", "tax"]),
   freee_id: int,
   name: z.string(),
-  attrs: z.record(z.string(), z.unknown()),
+  attrs: z.record(z.string(), z.unknown()).superRefine((attrs, ctx) => {
+    // fixed_asset は固定資産の強制「低」の根拠。存在するのに真偽値でない値を false として読むと、そのガードが静かに外れる
+    if (Object.hasOwn(attrs, "fixed_asset") && typeof attrs.fixed_asset !== "boolean") {
+      ctx.addIssue({ code: "custom", path: ["fixed_asset"], message: "fixed_asset は true か false のどちらかで指定してください" });
+    }
+  }),
 });
 
 const customerRow = z.object({
@@ -88,23 +119,23 @@ function check<T>(result: { data: T | null; error: { message: string } | null },
 
 /**
  * service_role で接続した Supabase を使う実装。RLS を通らないので、読むときは必ず customer_id で絞る。
+ * owner は 1 回の実行ごとに新しく作る（貸出しの所有者。実行をまたいで使い回さない）。
  */
-export function supabaseProposalStore(client: SupabaseClient): ProposalStore {
+export function supabaseProposalStore(client: SupabaseClient, owner: string = randomUUID()): ProposalStore {
   return {
-    async listPendingTransactions(limit) {
+    async claimPendingBatch(limit) {
+      // service_role 専用の RPC。位置の更新と貸出しまで DB 側で行うため、ここでは位置を持たない
       const data = check(
-        await client
-          .from("bank_transactions")
-          .select("id, customer_id, wallet_id, txn_date, amount, direction, description")
-          .eq("status", "new")
-          .order("txn_date")
-          .limit(limit),
+        await client.rpc("claim_pending_proposal_batch", { p_limit: limit, p_owner: owner, p_lease_seconds: CLAIM_LEASE_SECONDS }),
         "未判定の明細",
       );
-      return z
-        .array(txnRow)
-        .parse(data)
-        .map((r) => ({
+      const parsed = z.array(txnRow).safeParse(data);
+      if (!parsed.success) {
+        // 呼出し側（run.ts）はまだ 1 行も受け取っていないので、貸出し済みの行は返却されない。ここで返してから元の検証エラーを投げる
+        await releaseUnparsedClaims(client, owner, data);
+        throw parsed.error;
+      }
+      return parsed.data.map((r) => ({
           id: r.id,
           customerId: r.customer_id,
           walletId: r.wallet_id,
@@ -113,6 +144,22 @@ export function supabaseProposalStore(client: SupabaseClient): ProposalStore {
           direction: r.direction,
           description: r.description,
         }));
+    },
+
+    async confirmClaim(bankTransactionId) {
+      const { data, error } = await client.rpc("renew_proposal_claim", {
+        p_owner: owner,
+        p_bank_transaction_id: bankTransactionId,
+        p_lease_seconds: CLAIM_LEASE_SECONDS,
+      });
+      if (error) throw new Error(`貸出しの確認に失敗しました: ${error.message}`);
+      return z.boolean().parse(data);
+    },
+
+    async releaseClaims(bankTransactionIds) {
+      if (bankTransactionIds.length === 0) return;
+      const { error } = await client.rpc("release_proposal_claims", { p_owner: owner, p_ids: bankTransactionIds });
+      if (error) throw new Error(`貸出しの返却に失敗しました: ${error.message}`);
     },
 
     async loadCustomerContext(customerId, onDate) {
@@ -146,6 +193,8 @@ export function supabaseProposalStore(client: SupabaseClient): ProposalStore {
             .select("id, entry_date, amount, direction, bank_description, partner_key, account_item_id, tax_code, partner_id, item_id, section_id, tag_ids, description")
             .eq("customer_id", customerId)
             .gte("entry_date", shiftYears(onDate, -2))
+            // 基準日（ジョブの実行日）より後の仕訳は、まだ存在しない前提の情報なので使わない
+            .lte("entry_date", onDate)
             .order("id")
             .range(from, to),
         ),
@@ -242,15 +291,48 @@ export function supabaseProposalStore(client: SupabaseClient): ProposalStore {
     },
 
     async recordDecision(row) {
-      const { data, error } = await client.rpc("record_ai_decision", { p_decision: row });
+      // 貸出しの所有者だけが記録できる（record_ai_decision の「new にだけ記録」も DB 側で維持される）
+      const { data, error } = await client.rpc("record_claimed_ai_decision", { p_owner: owner, p_decision: row });
       if (error) throw new Error(`AI判断の記録に失敗しました: ${error.message}`);
       return z.string().uuid().parse(data);
     },
   };
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * 貸出しの RPC が成功したのに返り値の検証に失敗したとき、返り値の生の配列から ID を特定できる行の貸出しを、このストア自身の owner で返す。
+ * 返り値の中の owner は使わない。ID が特定できなければ（配列でない・UUID でない）何もせず、期限（CLAIM_LEASE_SECONDS）に任せる。
+ * 最善努力: 返却の失敗は握りつぶし、呼出し側は元の検証エラーを投げる。
+ */
+async function releaseUnparsedClaims(client: SupabaseClient, owner: string, raw: unknown): Promise<void> {
+  if (!Array.isArray(raw)) return;
+  const ids = new Set<string>();
+  for (const item of raw as unknown[]) {
+    if (typeof item !== "object" || item === null) continue;
+    const id = (item as { id?: unknown }).id;
+    if (typeof id === "string" && UUID_PATTERN.test(id)) ids.add(id);
+  }
+  if (ids.size === 0) return;
+  try {
+    await client.rpc("release_proposal_claims", { p_owner: owner, p_ids: [...ids] });
+  } catch {
+    // 元の検証エラーを隠さない
+  }
+}
+
 /** 過去仕訳は直近24か月分を使う（設計書3章） */
-function shiftYears(date: string, years: number): string {
+export function shiftYears(date: string, years: number): string {
   const [y, m, d] = date.split("-");
-  return `${Number(y) + years}-${m}-${d}`;
+  const month = Number(m);
+  const year = Number(y) + years;
+  // 暦の年単位でずらす。移動先に同じ日がない（うるう日 → 平年）ときは、その月の末日に丸める
+  const day = Math.min(Number(d), daysInMonth(year, month));
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }

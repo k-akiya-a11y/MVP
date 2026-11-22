@@ -3,8 +3,12 @@ import { z } from "zod";
 import type { StatementImportGateway } from "./import";
 
 const count = z.number().int().nonnegative();
-// bigint の金額は supabase-js では number で返る
-const yen = z.coerce.number().int().nonnegative();
+// 金額（bigint）は number でも数字だけの文字列でも返り得る。null・空文字・真偽値などを 0 円・1 円にしないよう、
+// number か数字だけの文字列に限って Number に変換し、0 以上の安全な整数だけを受け付ける（src/lib/statements/history.ts の amount と同じ契約）
+const yen = z
+  .union([z.number(), z.string().regex(/^\d+$/)])
+  .transform(Number)
+  .pipe(z.number().int().nonnegative().safe());
 
 const resultSchema = z
   .array(

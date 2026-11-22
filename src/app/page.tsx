@@ -2,35 +2,40 @@ import Link from "next/link";
 import { z } from "zod";
 import { createUserClient } from "@/lib/supabase/server";
 import { fetchAll } from "@/lib/supabase/fetch-all";
-import { PENDING_STATUSES, loadPendingCounts, type PendingCounts, type PendingStatus } from "@/lib/review/counts";
+import { PENDING_STATUSES, loadPendingCounts, type PendingCounts } from "@/lib/review/counts";
 
 export const dynamic = "force-dynamic";
 
 /**
  * 担当顧客の一覧と、確認待ちの件数。件数は DB で数える（pending_transaction_counts）ので、
- * 明細が 1,000 件を超えても欠けない。読めなかったときは 0 件と見せず、読めなかったと表示する。
+ * 明細が 1,000 件を超えても欠けない。読めなかったときは 0 件とも「顧客なし」とも見せず、固定文言で読めなかったと表示する。
  */
 export default async function HomePage() {
-  const client = await createUserClient();
-  let customers: { id: string; name: string }[] = [];
-  let counts: PendingCounts | null = null;
-  let loadError: string | null = null;
+  let customers: { id: string; name: string }[];
+  let counts: PendingCounts;
   try {
+    const client = await createUserClient();
     const [customerRows, loaded] = await Promise.all([
       fetchAll("顧客", (from, to) => client.from("customers").select("id, name").order("name").order("id").range(from, to)),
       loadPendingCounts(client),
     ]);
     customers = z.array(z.object({ id: z.string(), name: z.string() })).parse(customerRows);
     counts = loaded;
-  } catch (error) {
-    loadError = error instanceof Error ? error.message : String(error);
+  } catch {
+    // 例外の中身は画面に出さない。一覧・件数・リンクも出さず、0 件や「顧客なし」と見せない
+    return (
+      <main>
+        <h1>結乃社 AI経理</h1>
+        <p className="error">
+          顧客一覧または確認待ち件数を読み込めなかったため表示できません。担当顧客や確認待ちがないことを意味しません。時間をおいて再読み込みしてください。
+        </p>
+      </main>
+    );
   }
-  const count = (customerId: string, status: PendingStatus) => (counts ? counts.get(customerId, status) : "—");
 
   return (
     <main>
       <h1>結乃社 AI経理</h1>
-      {loadError && <p className="error">一覧または件数を読み込めませんでした。画面を再読み込みしてください（{loadError}）</p>}
       <table>
         <thead>
           <tr>
@@ -49,14 +54,14 @@ export default async function HomePage() {
               </td>
               {PENDING_STATUSES.map((s) => (
                 <td key={s} className="num">
-                  {count(c.id, s)}
+                  {counts.get(c.id, s)}
                 </td>
               ))}
             </tr>
           ))}
         </tbody>
       </table>
-      {!loadError && customers.length === 0 && <p>担当している顧客がありません。</p>}
+      {customers.length === 0 && <p>担当している顧客がありません。</p>}
     </main>
   );
 }

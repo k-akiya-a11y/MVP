@@ -30,7 +30,13 @@ export async function POST(request: Request, context: { params: Promise<{ custom
     return NextResponse.json({ error: "ログインしてください" }, { status: 401 });
   }
 
-  const form = await request.formData();
+  // multipart として読めない本文（boundary 欠落・途中切れ等）は 400。ここだけを捕捉し、口座検索・取込の例外は握りつぶさない
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch {
+    return NextResponse.json({ error: "アップロードの形式が不正です" }, { status: 400 });
+  }
   const fields = formSchema.safeParse({ walletId: form.get("walletId"), formatId: form.get("formatId") });
   const file = form.get("file");
   if (!fields.success || !(file instanceof File)) {

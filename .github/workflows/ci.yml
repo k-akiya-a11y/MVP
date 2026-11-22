@@ -4,32 +4,65 @@ on:
   pull_request:
   push:
     branches: [main]
+  # 手動実行（ブランチを選んで同じ検証を流す）。秘密情報・入力は使わない
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# 同じ PR / ブランチの古い実行は、新しいコミットで取り消す（push 先の main は取り消さない）
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    # 明示の bash は -eo pipefail で動く。パイプを使う手順でも失敗が隠れない
+    # キャッシュ・アーティファクトは使わない（標準ランナーの通常ログのみ）
+    shell: bash
+
 jobs:
   check:
     name: lint・型チェック・ユニットテスト
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci
+      - name: 版の記録（通常のログのみ・環境変数は出力しない）
+        run: |
+          echo "commit: $(git rev-parse HEAD)"
+          echo "node: $(node --version)"
+          echo "npm: $(npm --version)"
+          echo "os: $(uname -sr)"
+      - run: npm ci --ignore-scripts
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm test
+      - name: ユニットテスト
+        run: npm test
       - run: npm run build
 
   db:
-    name: マイグレーション・RLS テスト
-    runs-on: ubuntu-latest
+    name: マイグレーション・RLS・アップグレード・並行テスト（PostgreSQL ${{ matrix.pg_version }}）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      # 片方の失敗でもう片方を止めない（版ごとの結果を両方見る）
+      fail-fast: false
+      matrix:
+        include:
+          # PG16: 従来のベースライン。ランナーに入っているクライアントを使う
+          - pg_major: "16"
+            pg_version: "16.15"
+          # PG17: 実 Supabase のメタデータ（17.11.0.003）に合わせた合成の互換性検証。Supabase 全体の再現ではない
+          - pg_major: "17"
+            pg_version: "17.11"
     services:
       postgres:
-        image: postgres:16
+        # マイナーバージョンまで固定する（下の「Postgres の版を確認」で実際の版も検査する）
+        image: postgres:${{ matrix.pg_version }}
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -40,13 +73,100 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      # CI の使い捨てサービスコンテナ（localhost）専用の値。実在の環境には接続しない
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # バックアップ・復元テスト（tests/db/backup-restore.test.ts）の opt-in。このジョブのサービスコンテナは使い捨ての専用クラスタ
+      TEST_DATABASE_DISPOSABLE: "1"
+      # 行列の版。テスト（tests/db/pg-cli.ts）は 16 または 17 だけを受け付け、サーバーとクライアントの一致を要求する
+      PG_MAJOR: ${{ matrix.pg_major }}
+      PG_VERSION: ${{ matrix.pg_version }}
+      TEST_PG_MAJOR: ${{ matrix.pg_major }}
+      # クライアントの明示パス。使わない側の版の変数は、テストが参照しない
+      PG16_PG_DUMP: /usr/lib/postgresql/16/bin/pg_dump
+      PG16_PG_RESTORE: /usr/lib/postgresql/16/bin/pg_restore
+      PG17_PG_DUMP: /usr/lib/postgresql/17/bin/pg_dump
+      PG17_PG_RESTORE: /usr/lib/postgresql/17/bin/pg_restore
     steps:
       - uses: actions/checkout@v4
+        with:
+          # アップグレードテストが固定のベースラインのコミットを git から読むため、全履歴を取得する
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run db:apply
-      - run: npm run test:db
+      # PG17 だけ。ランナーには PostgreSQL 16 しか入っていない前提で、17 のクライアントだけを公式 PGDG の apt リポジトリから入れる。
+      # 信頼の根拠: 取得元は apt.postgresql.org（PostgreSQL 公式）、署名鍵は postgresql.org 配布のものをフィンガープリントで固定して検証し、
+      # signed-by でこのリポジトリにだけ使う。サーバーは入れない（postgresql-client-17 のみ）。インストールはこの使い捨てランナー内に限る
+      - name: PostgreSQL 17 クライアントの導入（公式 PGDG apt・CI 専用）
+        if: matrix.pg_major == '17'
+        run: |
+          expected_fpr="B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8"
+          tmp="$(mktemp -d)"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc --output "$tmp/pgdg.asc"
+          actual_fpr="$(gpg --show-keys --with-colons "$tmp/pgdg.asc" | awk -F: '$1 == "fpr" { print $10; exit }')"
+          if [ "$actual_fpr" != "$expected_fpr" ]; then
+            echo "unexpected PGDG signing key fingerprint" >&2
+            exit 1
+          fi
+          sudo install -D -m 0644 "$tmp/pgdg.asc" /usr/share/keyrings/postgresql-pgdg.asc
+          echo "deb [signed-by=/usr/share/keyrings/postgresql-pgdg.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          # サーバーと同じ版に固定する。その版が無ければここで失敗する（別の 17.x で代用しない）
+          sudo apt-get install -y -qq --no-install-recommends "postgresql-client-17=${PG_VERSION}-*"
+      # psql・pg_dump・pg_restore を行列の版のディレクトリーから解決させる（以降のステップと npm スクリプトの psql も同じ版になる）
+      - name: クライアントの版のディレクトリーを PATH の先頭に置く
+        run: echo "/usr/lib/postgresql/${PG_MAJOR}/bin" >> "$GITHUB_PATH"
+      - name: PostgreSQL クライアント（psql・pg_dump・pg_restore）の版を確認
+        run: |
+          bin="/usr/lib/postgresql/${PG_MAJOR}/bin"
+          for tool in psql pg_dump pg_restore; do
+            if [ ! -x "$bin/$tool" ]; then
+              echo "missing $bin/$tool" >&2
+              exit 1
+            fi
+            if [ "$(command -v "$tool")" != "$bin/$tool" ]; then
+              echo "$tool does not resolve to $bin" >&2
+              exit 1
+            fi
+            out="$("$bin/$tool" --version)"
+            echo "$out"
+            # メジャー版は両方の行で完全一致を要求する
+            case "$out" in
+              "$tool (PostgreSQL) ${PG_MAJOR}."*) ;;
+              *) echo "expected PostgreSQL ${PG_MAJOR} client: $tool" >&2; exit 1 ;;
+            esac
+            # PG17 はこのジョブが入れたクライアントなので、マイナー版もサーバーと完全一致を要求する（PG16 はランナー同梱で、メジャー版のみ）
+            if [ "$PG_MAJOR" = "17" ]; then
+              case "$out" in
+                "$tool (PostgreSQL) ${PG_VERSION} "*) ;;
+                *) echo "expected PostgreSQL ${PG_VERSION} client: $tool" >&2; exit 1 ;;
+              esac
+            fi
+          done
+      - name: 版の記録（通常のログのみ・環境変数は出力しない）
+        run: |
+          echo "commit: $(git rev-parse HEAD)"
+          echo "node: $(node --version)"
+          echo "npm: $(npm --version)"
+          echo "psql: $(psql --version)"
+          echo "os: $(uname -sr)"
+          echo "postgres server: $(psql "$TEST_DATABASE_URL" -Atc 'show server_version')"
+      - name: Postgres サーバーの版を確認
+        run: |
+          version="$(psql "$TEST_DATABASE_URL" -Atc 'show server_version' | cut -d' ' -f1)"
+          if [ "$version" != "$PG_VERSION" ]; then
+            echo "expected Postgres $PG_VERSION but got $version" >&2
+            exit 1
+          fi
+          major="$(( $(psql "$TEST_DATABASE_URL" -Atc 'show server_version_num') / 10000 ))"
+          if [ "$major" != "$PG_MAJOR" ]; then
+            echo "expected Postgres major $PG_MAJOR but got $major" >&2
+            exit 1
+          fi
+      - run: npm ci --ignore-scripts
+      - name: 土台・マイグレーション・seed の適用（空の DB から）
+        run: npm run db:apply
+      - name: DB テスト（RLS・アップグレード・並行）
+        run: npm run test:db

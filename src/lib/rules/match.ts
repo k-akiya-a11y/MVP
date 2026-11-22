@@ -30,5 +30,6 @@ export function renderDescriptionTemplate(template: string, txn: BankTransaction
   return template
     .replaceAll("{year}", year ?? "")
     .replaceAll("{month}", String(Number(month)))
-    .replaceAll("{description}", txn.description);
+    // 関数で渡して、摘要の `$&` `$$` などを置換記号として解釈させない（摘要は外部入力でそのまま入れる）
+    .replaceAll("{description}", () => txn.description);
 }
