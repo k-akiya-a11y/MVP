@@ -662,6 +662,56 @@ describe("runProposalJob: 時間の上限", () => {
     finishLate(okResult);
   });
 
+  it("締切を過ぎてから AI の応答が届いても、判断ログを書かず、返した結果も書き換えない", async () => {
+    const db = new FakeDb([aiRow(1)]);
+    let finishLate: (r: AiCallResult) => void = () => undefined;
+    const hanging = vi.fn<JournalAi>(() => new Promise<AiCallResult>((resolve) => (finishLate = resolve)));
+    const { store, rows } = capturingStore(db);
+    const result = await runProposalJob({ store, ai: hanging, today: TODAY, aiTimeoutMs: 5, lateDeadlineMs: 20 });
+    const snapshot = structuredClone(result);
+
+    finishLate(okResult);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(rows).toEqual([]);
+    expect(db.recorded).toEqual([]);
+    expect(result).toEqual(snapshot);
+    expect(result).toMatchObject({ processed: 0, failures: [{ bankTransactionId: "t0001" }] });
+  });
+
+  it("締切前に記録を始め、記録が締切をまたいだら、記録されたかは不明として失敗に残す（確定扱いにしない）", async () => {
+    const db = new FakeDb([aiRow(1)]);
+    const base = db.store();
+    let finishRecord: () => void = () => undefined;
+    let recordStarted = false;
+    const store: ProposalStore & { owner: string } = {
+      ...base,
+      recordDecision: async (d) => {
+        recordStarted = true;
+        await new Promise<void>((resolve) => (finishRecord = resolve));
+        return base.recordDecision(d);
+      },
+    };
+    let finishLate: (r: AiCallResult) => void = () => undefined;
+    const hanging = vi.fn<JournalAi>(() => new Promise<AiCallResult>((resolve) => (finishLate = resolve)));
+    const running = runProposalJob({ store, ai: hanging, today: TODAY, aiTimeoutMs: 5, lateDeadlineMs: 500 });
+    await vi.waitFor(() => expect(hanging).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 15)); // 待ち時間の上限（5ms）を過ぎてから届く
+    finishLate(okResult);
+    await vi.waitFor(() => expect(recordStarted).toBe(true));
+
+    const result = await running; // 記録が終わらないまま締切を迎える
+    const snapshot = structuredClone(result);
+    expect(result.processed).toBe(0);
+    expect(result.failures).toEqual([{ bankTransactionId: "t0001", error: expect.stringContaining("記録されたかは不明") }]);
+    // 記録の結果が分からないので、貸出しは返さない
+    expect(db.leases.get("t0001")?.owner).toBe(store.owner);
+
+    // 締切の後に DB への書込が終わっても、返した結果は変わらない
+    finishRecord();
+    await vi.waitFor(() => expect(db.recorded).toEqual(["t0001"]));
+    expect(result).toEqual(snapshot);
+  });
+
   it("待ちきれなかった後に元の処理が失敗したら、未処理の拒否として落とさず、貸出しを返して次の巡回で判定し直す", async () => {
     const db = new FakeDb([aiRow(1)]);
     let failLate: (e: Error) => void = () => undefined;

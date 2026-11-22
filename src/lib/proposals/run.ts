@@ -82,6 +82,7 @@ function waitAtMost(promise: Promise<unknown>, ms: number): Promise<void> {
  *     （モデル・使用量・費用が残り、承認キューに入る。失敗の一覧からは外し、processed に数える）。遅れて失敗したら貸出しを返し、次の巡回で判定し直す
  * 限界: 期限が切れても古い実行の AI 呼出しが続いていれば二重に呼ばれうる。期限は関数の最大実行時間より長くして避けている。
  *   LATE_DEADLINE_MS までに届かなかった呼出しは、費用がかかっても判断ログに残らない（関数が止められるため）。失敗として返し、貸出しは期限まで返さない。
+ *   締切で受付を閉じ、その後に届いた結果は記録せず、返した結果も書き換えない。締切の時点で記録の途中だったものは「記録されたかは不明」の失敗として返す。
  * 1回の AI 呼出しの上限は 200 件のまま増やさない。
  */
 export async function runProposalJob(
@@ -120,21 +121,32 @@ export async function runProposalJob(
   const settled = new Set<string>();
   // 待つのをやめた判定の続き（届いたら記録する）。実行の終わりに LATE_DEADLINE_MS まで待つ
   const late: Promise<void>[] = [];
+  // 締切（LATE_DEADLINE_MS）を過ぎたら受付を閉じる。閉じた後に届いた結果は記録せず、返した結果も書き換えない
+  let lateClosed = false;
+  // 締切の時点で記録（DB 書込）を始めていて、まだ終わっていない明細の失敗。締切後は結果不明として確定扱いにしない
+  const recording = new Set<{ bankTransactionId: string; error: string }>();
   const followLate = (txnId: string, pending: Promise<DecisionDraft>, failure: { bankTransactionId: string; error: string }) => {
     late.push(
       pending.then(
         async (draft) => {
+          if (lateClosed) return;
+          recording.add(failure);
           try {
             await deps.store.recordDecision(toAiDecisionRow(draft));
           } catch (error) {
+            if (lateClosed) return;
             failure.error = `遅れて届いた判定を記録できませんでした: ${error instanceof Error ? error.message : String(error)}`;
             return;
+          } finally {
+            if (!lateClosed) recording.delete(failure);
           }
+          if (lateClosed) return;
           result.failures.splice(result.failures.indexOf(failure), 1);
           result.processed++;
           result.byConfidence[draft.confidence.level]++;
         },
         (error: unknown) => {
+          if (lateClosed) return;
           // 呼出しが終わったので、貸出しを返して次の巡回で判定し直す
           failure.error = `遅れて失敗しました: ${error instanceof Error ? error.message : String(error)}`;
           settled.delete(txnId);
@@ -201,6 +213,11 @@ export async function runProposalJob(
   } finally {
     if (late.length > 0) {
       await waitAtMost(Promise.all(late), startedAt + lateDeadlineMs - now());
+      lateClosed = true;
+      // 記録の途中で締切を迎えたものは、DB に記録されたかが分からない。成功扱いにせず、貸出しも返さない（記録済みなら次の巡回で new でないため渡らない）
+      for (const failure of recording) {
+        failure.error = `締切までに判断ログの記録が終わらず、記録されたかは不明です（${failure.bankTransactionId}）`;
+      }
     }
     const release = owned.filter((t) => !settled.has(t.id)).map((t) => t.id);
     if (release.length > 0) {
