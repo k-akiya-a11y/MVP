@@ -601,38 +601,95 @@ describe("runProposalJob: 失敗・中止・クラッシュ", () => {
 });
 
 describe("runProposalJob: 時間の上限", () => {
-  it("1件の判定が待ち時間の上限を超えたら待つのをやめ、遅れた結果は記録せず、貸出しは期限まで返さない", async () => {
+  /** recordDecision に渡った判断ログの行を集めるストア */
+  function capturingStore(db: FakeDb) {
+    const base = db.store();
+    const rows: Parameters<ProposalStore["recordDecision"]>[0][] = [];
+    const store: ProposalStore & { owner: string } = {
+      ...base,
+      recordDecision: async (d) => {
+        rows.push(d);
+        return base.recordDecision(d);
+      },
+    };
+    return { store, rows };
+  }
+
+  it("1件の判定が待ち時間の上限を超えたら次の明細へ進み、遅れて届いた結果はモデル・使用量・費用つきで判断ログに記録する", async () => {
     const db = new FakeDb([aiRow(1), row(2)]);
     let finishLate: (r: AiCallResult) => void = () => undefined;
     const hanging = vi.fn<JournalAi>(() => new Promise<AiCallResult>((resolve) => (finishLate = resolve)));
-    const store = db.store();
-    const result = await runProposalJob({ store, ai: hanging, today: TODAY, aiTimeoutMs: 10 });
+    const { store, rows } = capturingStore(db);
+    const running = runProposalJob({ store, ai: hanging, today: TODAY, aiTimeoutMs: 10, lateDeadlineMs: 5_000 });
 
-    // t0001 は待ちきれず失敗、t0002（ルール一致で AI なし）は続けて処理される
-    expect(result.failures).toEqual([{ bankTransactionId: "t0001", error: expect.stringContaining("終わりませんでした") }]);
-    expect(result.processed).toBe(1);
-    // 呼出しが続いているかもしれないので、貸出しは自分のまま残り、他の実行には渡らない
+    // t0002（ルール一致で AI なし）は待たずに先に処理される。t0001 は貸出しを持ったまま、他の実行には渡らない
+    await vi.waitFor(() => expect(db.recorded).toEqual(["t0002"]));
     expect(db.leases.get("t0001")?.owner).toBe(store.owner);
     expect(db.claim(db.newOwner(), 10)).toEqual([]);
 
-    // 遅れて届いた結果は、どこにも記録されない
+    // 上限を過ぎてから届いた結果も、捨てずに記録する
     finishLate(okResult);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(db.recorded).toEqual(["t0002"]);
+    const result = await running;
+    expect(db.recorded).toEqual(["t0002", "t0001"]);
+    expect(result).toMatchObject({ attempted: 2, processed: 2, failures: [] });
+    expect(db.pendingIds()).toEqual([]);
+    expect(db.leasedIds()).toEqual([]);
+    const lateRow = rows.find((r) => r.bank_transaction_id === "t0001");
+    expect(lateRow).toMatchObject({
+      model: JOURNAL_MODEL,
+      prompt_version: JOURNAL_PROMPT_VERSION,
+      input_tokens: usage.inputTokens,
+      output_tokens: usage.outputTokens,
+      cost_usd_micros: usage.costUsdMicros,
+    });
+  });
+
+  it("遅れた結果が待つ上限（lateDeadlineMs）までに届かなければ、失敗として返し、貸出しは期限まで返さない", async () => {
+    const db = new FakeDb([aiRow(1)]);
+    let finishLate: (r: AiCallResult) => void = () => undefined;
+    const hanging = vi.fn<JournalAi>(() => new Promise<AiCallResult>((resolve) => (finishLate = resolve)));
+    const store = db.store();
+    const result = await runProposalJob({ store, ai: hanging, today: TODAY, aiTimeoutMs: 5, lateDeadlineMs: 20 });
+
+    expect(result.failures).toEqual([{ bankTransactionId: "t0001", error: expect.stringContaining("終わりませんでした") }]);
+    expect(result.processed).toBe(0);
+    expect(db.recorded).toEqual([]);
+    expect(db.leases.get("t0001")?.owner).toBe(store.owner);
 
     // 期限が切れれば次の実行が引き受ける
     db.clock += TTL_MS;
     expect(db.claim(db.newOwner(), 10).map((r) => r.id)).toEqual(["t0001"]);
+    finishLate(okResult);
   });
 
-  it("待ちきれなかった後に元の処理が失敗しても、未処理の拒否として落ちない", async () => {
+  it("待ちきれなかった後に元の処理が失敗したら、未処理の拒否として落とさず、貸出しを返して次の巡回で判定し直す", async () => {
     const db = new FakeDb([aiRow(1)]);
     let failLate: (e: Error) => void = () => undefined;
     const hanging = vi.fn<JournalAi>(() => new Promise<AiCallResult>((_, reject) => (failLate = reject)));
-    const result = await db.run(10, hanging, { aiTimeoutMs: 5 });
-    expect(result.failures).toHaveLength(1);
+    const running = db.run(10, hanging, { aiTimeoutMs: 5, lateDeadlineMs: 5_000 });
+    await vi.waitFor(() => expect(hanging).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 20));
     failLate(new Error("late failure"));
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    const result = await running;
+    expect(result.failures).toEqual([{ bankTransactionId: "t0001", error: expect.stringContaining("late failure") }]);
+    expect(db.recorded).toEqual([]);
+    expect(db.leasedIds()).toEqual([]);
+    expect(db.pendingIds()).toEqual(["t0001"]);
+  });
+
+  it("遅れて届いた結果の記録に失敗したら、失敗として返す（記録できたことにしない）", async () => {
+    const db = new FakeDb([aiRow(1)]);
+    db.failing = (v) => v === "t0001";
+    let finishLate: (r: AiCallResult) => void = () => undefined;
+    const hanging = vi.fn<JournalAi>(() => new Promise<AiCallResult>((resolve) => (finishLate = resolve)));
+    const running = db.run(10, hanging, { aiTimeoutMs: 5, lateDeadlineMs: 5_000 });
+    await vi.waitFor(() => expect(hanging).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    finishLate(okResult);
+    const result = await running;
+    expect(result.processed).toBe(0);
+    expect(result.failures).toEqual([{ bankTransactionId: "t0001", error: expect.stringContaining("記録できませんでした") }]);
+    expect(db.recorded).toEqual([]);
   });
 
   it("時間の予算を超えたら新しい判定を始めず、残りの貸出しを返して truncated にする", async () => {

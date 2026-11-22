@@ -1,6 +1,6 @@
 import type { JournalAi } from "../ai/client";
 import { toAiDecisionRow } from "../audit/decision-log";
-import { proposeForTransaction } from "./propose";
+import { proposeForTransaction, type DecisionDraft } from "./propose";
 import type { ProposalStore } from "./store";
 import type { BankTransaction } from "./types";
 
@@ -23,8 +23,17 @@ export const MAX_ATTEMPTS_PER_RUN = 200;
  */
 export const RUN_BUDGET_MS = 200_000;
 
-/** 1件の判定（AI 呼出しを含む）を待つ上限（ミリ秒）。超えたら待つのをやめ、遅れて届いた結果は捨てる */
+/**
+ * 1件の判定（AI 呼出しを含む）を待つ上限（ミリ秒）。超えたら次の明細へ進むが、呼出しは捨てない。
+ * 遅れて届いた結果は、実行の終わりに LATE_DEADLINE_MS まで待って判断ログに記録する（費用がかかった呼出しの使用量・費用を残すため）
+ */
 export const AI_CALL_TIMEOUT_MS = 60_000;
+
+/**
+ * 実行の開始から、遅れている判定を待ってよい上限（ミリ秒）。cron ルートの maxDuration（300 秒）より短くし、記録と貸出しの返却の時間を残す。
+ * RUN_BUDGET_MS（200 秒）で最後に始めた判定は AI_CALL_TIMEOUT_MS で 260 秒までに待つのをやめ、ここで 280 秒まで待つ
+ */
+export const LATE_DEADLINE_MS = 280_000;
 
 /** 待つのをやめた（呼出しはまだ続いている可能性がある） */
 class AttemptTimeout extends Error {}
@@ -37,6 +46,16 @@ function withTimeout<T>(promise: Promise<T>, ms: number, bankTransactionId: stri
   // 待つのをやめた後に元の処理が失敗しても、未処理の拒否として落とさない
   promise.catch(() => undefined);
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** promise を ms まで待つ（ms <= 0 なら待たない）。待ちきれなくても例外にしない */
+function waitAtMost(promise: Promise<unknown>, ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  return Promise.race([promise.then(() => undefined), timeout]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -58,8 +77,11 @@ function withTimeout<T>(promise: Promise<T>, ms: number, bankTransactionId: stri
  *   - 失敗・未着手の明細は最後に貸出しを返す。中止・例外でも finally で返す。落ちて返せなければ期限（600 秒）で切れる
  *   - 時間: 予算（RUN_BUDGET_MS）を超えたら新しい明細を借りず判定も始めない。1件は AI_CALL_TIMEOUT_MS で「呼出し側が」待つのをやめる。
  *     待つのをやめることは外部の呼出しの取消しではない（AI への要求は止まらず、費用がかかりうる）。待つのをやめた明細の貸出しは返さない
- *     （呼出しがまだ続いているかもしれないので、期限まで他の実行に渡さない。遅れた結果は記録しない）
+ *     （呼出しがまだ続いているかもしれないので、期限まで他の実行に渡さない）
+ *   - 遅れた結果: 呼出しは捨てず、実行の終わりに LATE_DEADLINE_MS まで待つ。届いたら、貸出しを持ったまま通常どおり判断ログに記録する
+ *     （モデル・使用量・費用が残り、承認キューに入る。失敗の一覧からは外し、processed に数える）。遅れて失敗したら貸出しを返し、次の巡回で判定し直す
  * 限界: 期限が切れても古い実行の AI 呼出しが続いていれば二重に呼ばれうる。期限は関数の最大実行時間より長くして避けている。
+ *   LATE_DEADLINE_MS までに届かなかった呼出しは、費用がかかっても判断ログに残らない（関数が止められるため）。失敗として返し、貸出しは期限まで返さない。
  * 1回の AI 呼出しの上限は 200 件のまま増やさない。
  */
 export async function runProposalJob(
@@ -71,6 +93,7 @@ export async function runProposalJob(
     now?: () => number;
     budgetMs?: number;
     aiTimeoutMs?: number;
+    lateDeadlineMs?: number;
   },
   batchSize = MAX_ATTEMPTS_PER_RUN,
 ): Promise<ProposalRunResult> {
@@ -84,6 +107,7 @@ export async function runProposalJob(
   const now = deps.now ?? Date.now;
   const budgetMs = deps.budgetMs ?? RUN_BUDGET_MS;
   const aiTimeoutMs = deps.aiTimeoutMs ?? AI_CALL_TIMEOUT_MS;
+  const lateDeadlineMs = deps.lateDeadlineMs ?? LATE_DEADLINE_MS;
 
   // 呼出し側の指定でも上限（200）を超えない。1 未満や整数でない値は既定の上限を使う
   const limit = Number.isInteger(batchSize) && batchSize >= 1 ? Math.min(batchSize, MAX_ATTEMPTS_PER_RUN) : MAX_ATTEMPTS_PER_RUN;
@@ -94,6 +118,30 @@ export async function runProposalJob(
   // 貸出しを返さない明細: 記録できた（貸出しは記録と同時に終わる）、または待つのをやめた（呼出しが続いているかもしれない）もの。
   // それ以外（失敗・例外で中断）は finally で返す
   const settled = new Set<string>();
+  // 待つのをやめた判定の続き（届いたら記録する）。実行の終わりに LATE_DEADLINE_MS まで待つ
+  const late: Promise<void>[] = [];
+  const followLate = (txnId: string, pending: Promise<DecisionDraft>, failure: { bankTransactionId: string; error: string }) => {
+    late.push(
+      pending.then(
+        async (draft) => {
+          try {
+            await deps.store.recordDecision(toAiDecisionRow(draft));
+          } catch (error) {
+            failure.error = `遅れて届いた判定を記録できませんでした: ${error instanceof Error ? error.message : String(error)}`;
+            return;
+          }
+          result.failures.splice(result.failures.indexOf(failure), 1);
+          result.processed++;
+          result.byConfidence[draft.confidence.level]++;
+        },
+        (error: unknown) => {
+          // 呼出しが終わったので、貸出しを返して次の巡回で判定し直す
+          failure.error = `遅れて失敗しました: ${error instanceof Error ? error.message : String(error)}`;
+          settled.delete(txnId);
+        },
+      ),
+    );
+  };
   try {
     while (true) {
       if (result.attempted >= limit) {
@@ -130,17 +178,30 @@ export async function runProposalJob(
           result.truncated = true;
           break;
         }
-        const draft = await withTimeout(proposeForTransaction(ctx, txn, deps.ai), aiTimeoutMs, txn.id);
+        const pending = proposeForTransaction(ctx, txn, deps.ai);
+        let draft: DecisionDraft;
+        try {
+          draft = await withTimeout(pending, aiTimeoutMs, txn.id);
+        } catch (error) {
+          if (!(error instanceof AttemptTimeout)) throw error;
+          const failure = { bankTransactionId: txn.id, error: error.message };
+          result.failures.push(failure);
+          settled.add(txn.id);
+          followLate(txn.id, pending, failure);
+          continue;
+        }
         await deps.store.recordDecision(toAiDecisionRow(draft));
         settled.add(txn.id);
         result.processed++;
         result.byConfidence[draft.confidence.level]++;
       } catch (error) {
         result.failures.push({ bankTransactionId: txn.id, error: error instanceof Error ? error.message : String(error) });
-        if (error instanceof AttemptTimeout) settled.add(txn.id);
       }
     }
   } finally {
+    if (late.length > 0) {
+      await waitAtMost(Promise.all(late), startedAt + lateDeadlineMs - now());
+    }
     const release = owned.filter((t) => !settled.has(t.id)).map((t) => t.id);
     if (release.length > 0) {
       // 返せなくても期限で切れる。返却の失敗で実行の結果（や元の例外）を隠さない
