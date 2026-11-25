@@ -49,6 +49,8 @@ export default async function CustomerReviewPage({ params }: { params: Promise<{
         {" / "}
         <Link href={`/customers/${customerId}/statements`}>取り込んだ明細の一覧を見る</Link>
         {" / "}
+        <Link href={`/customers/${customerId}/freee`}>freee 連携</Link>
+        {" / "}
         <Link href={`/customers/${customerId}/past-quality`}>過去仕訳の科目の揺れを確認する</Link>
         {" / "}
         <Link href={`/customers/${customerId}/rules`}>顧客ルールを確認・編集する</Link>
