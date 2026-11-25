@@ -89,23 +89,29 @@ describe("freee のアクセストークン（更新は一か所・ロックつ�
     expect(s).toMatchObject({ status: "needs_reauth", lockOwner: null });
   });
 
-  it("通信の失敗などでは再認可にせず、ロックだけ外して例外を返す", async () => {
+  it("通信の失敗・期限切れ（結果が分からない）でも、同じトークンを再送しないよう再認可待ちにする。外部のエラー文は出さない", async () => {
     const { s, store } = fakeStore({ accessToken: "a1", refreshToken: "r1", expiresAt: NOW - 1 });
     const refresh = vi.fn(async () => {
-      throw new Error("network down");
+      throw new Error("timeout SECRET-refresh-r1");
     });
-    await expect(getFreeeAccessToken(C, { store, refresh, now: () => NOW })).rejects.toThrow("network down");
-    expect(s).toMatchObject({ status: "active", lockOwner: null });
+    const err = await getFreeeAccessToken(C, { store, refresh, now: () => NOW }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FreeeNeedsReauthError);
+    expect(String((err as Error).message)).not.toContain("SECRET");
+    expect(s).toMatchObject({ status: "needs_reauth", lockOwner: null });
+    // 2回目は freee を呼ばない
+    await expect(getFreeeAccessToken(C, { store, refresh, now: () => NOW })).rejects.toBeInstanceOf(FreeeNeedsReauthError);
+    expect(refresh).toHaveBeenCalledTimes(1);
   });
 
   it("更新できたのに保存できなければ、そのことを例外で伝える（黙って続けない）", async () => {
     const { s, store } = fakeStore({ accessToken: "a1", refreshToken: "r1", expiresAt: NOW - 1 });
     store.completeRefresh = async () => {
-      throw new Error("トークン更新のロックを持っていません");
+      throw new Error("db down SECRET-access-a2");
     };
-    await expect(getFreeeAccessToken(C, { store, refresh: fakeRefresh(s), now: () => NOW })).rejects.toBeInstanceOf(
-      FreeeRefreshNotSavedError,
-    );
+    const err = await getFreeeAccessToken(C, { store, refresh: fakeRefresh(s), now: () => NOW }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(FreeeRefreshNotSavedError);
+    expect(String((err as Error).message)).not.toContain("SECRET");
+    expect(s.status).toBe("needs_reauth");
   });
 
   it("未接続・再認可待ちなら freee を呼ばずに止める", async () => {

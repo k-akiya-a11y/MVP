@@ -15,9 +15,14 @@ const rowSchema = z.object({
   access_token_expires_at: z.string().transform((s) => new Date(s)).pipe(z.date()),
 });
 
-function fail(what: string, error: { message?: string } | null): never {
-  // DB のエラー文にはトークンは入らない（引数は載らない）が、念のため固定の説明を前に置く
-  throw new Error(`${what}に失敗しました（${error?.message ?? "不明なエラー"}）`);
+/**
+ * トークンを扱う境界の失敗は、固定の文言だけの例外にする。DB・SDK のエラー文は載せない
+ * （エラー文に引数やトークンが入る可能性を排除できず、この例外は画面と同期の記録に残るため）。SQLSTATE のコードだけは調査用に残す
+ */
+export class FreeeTokenStoreError extends Error {}
+function fail(what: string, error: { code?: string } | null): never {
+  const code = typeof error?.code === "string" && /^[0-9A-Z]{5}$/.test(error.code) ? `（コード ${error.code}）` : "";
+  throw new FreeeTokenStoreError(`${what}に失敗しました${code}`);
 }
 
 export function supabaseFreeeTokenStore(service: SupabaseClient): FreeeTokenStore {
@@ -25,9 +30,13 @@ export function supabaseFreeeTokenStore(service: SupabaseClient): FreeeTokenStor
     async get(customerId): Promise<StoredAccessToken | null> {
       const { data, error } = await service.rpc("get_freee_access_token", { p_customer_id: customerId });
       if (error) fail("freee のトークンの読込", error);
-      const rows = z.array(z.unknown()).parse(data ?? []);
-      if (rows.length === 0) return null;
-      const r = rowSchema.parse(rows[0]);
+      const rows = z.array(z.unknown()).safeParse(data ?? []);
+      if (!rows.success) fail("freee のトークンの読込", null);
+      if (rows.data.length === 0) return null;
+      // 検証の失敗も固定の文言にする（zod のエラーに値が入らないように）
+      const parsed = rowSchema.safeParse(rows.data[0]);
+      if (!parsed.success) fail("freee のトークンの読込", null);
+      const r = parsed.data;
       return { companyId: r.freee_company_id, status: r.status, accessToken: r.access_token, expiresAt: r.access_token_expires_at };
     },
     async beginRefresh(customerId, owner, lockSeconds) {
@@ -37,8 +46,9 @@ export function supabaseFreeeTokenStore(service: SupabaseClient): FreeeTokenStor
         p_lock_seconds: lockSeconds,
       });
       if (error) fail("freee のトークン更新のロック", error);
-      const rows = z.array(z.object({ refresh_token: z.string().min(1) })).parse(data ?? []);
-      return rows[0]?.refresh_token ?? null;
+      const rows = z.array(z.object({ refresh_token: z.string().min(1) })).safeParse(data ?? []);
+      if (!rows.success) fail("freee のトークン更新のロック", null);
+      return rows.data[0]?.refresh_token ?? null;
     },
     async completeRefresh(customerId, owner, tokens: FreeeTokens) {
       const { error } = await service.rpc("complete_freee_token_refresh", {

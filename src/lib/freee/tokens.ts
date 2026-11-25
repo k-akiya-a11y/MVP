@@ -1,13 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { FreeeTokenError, type FreeeTokens } from "./oauth";
+import type { FreeeTokens } from "./oauth";
 
 /**
  * freee のアクセストークンを得る唯一の入口（CLAUDE.md 8章: リフレッシュトークンの更新は一か所にまとめ、ロックで同時更新を防ぐ）。
  *
+ * 使い捨てのリフレッシュトークンを二重に送らないための約束:
+ * - 更新を freee に送れるのは、DB のロックを取った処理だけ（ロックは REFRESH_LOCK_SECONDS、送信は TOKEN_REQUEST_TIMEOUT_MS で打ち切る）
+ * - 更新が失敗したら、理由にかかわらず（拒否・期限切れ・通信の失敗・応答の形の違い）、freee 側で使用済みになったか分からないので、
+ *   同じトークンを再送せず「再認可が必要」にする
+ * - 前の処理のロックが期限切れで残っていたら（応答の喪失・処理の停止）、DB が引き継がずに「再認可が必要」にする
+ *
  * - 期限まで REFRESH_MARGIN_MS 以上あれば、保存済みのアクセストークンをそのまま返す
  * - 期限が近い（または freee が 401 を返した）ときだけ更新する。更新は DB のロック（所有者と期限）を取った処理だけが行い、
  *   取れなかった処理は待ってから読み直す（他の処理が更新し終えていれば、その新しいトークンを使う）
- * - freee が更新を断った（invalid_grant）ときは、接続を「再認可が必要」にして止める
+ * - 更新に失敗したときは、接続を「再認可が必要」にして止める（上の約束）
  * - 更新は成功したのに保存に失敗した（ロックを失った等）ときは、使い捨てのリフレッシュトークンを失った可能性があるので、
  *   そのことを例外で伝える（黙って続けない）
  */
@@ -37,11 +43,10 @@ export class FreeeNeedsReauthError extends Error {
     super("freee との接続の再認可が必要です（管理者が接続し直してください）");
   }
 }
+/** 更新できたのに保存できなかった。外部のエラー文は載せない（固定の文言だけ） */
 export class FreeeRefreshNotSavedError extends Error {
-  constructor(cause: unknown) {
-    super(
-      `freee のトークンは更新されましたが、保存できませんでした。接続が切れている可能性があります（${cause instanceof Error ? cause.message : String(cause)}）`,
-    );
+  constructor() {
+    super("freee のトークンは更新されましたが、保存できませんでした。再認可が必要です（管理者が接続し直してください）");
   }
 }
 
@@ -83,16 +88,17 @@ export async function getFreeeAccessToken(
     let tokens: FreeeTokens;
     try {
       tokens = await deps.refresh(refreshToken);
-    } catch (error) {
-      const needsReauth = error instanceof FreeeTokenError && error.invalidGrant;
-      await deps.store.failRefresh(customerId, owner, needsReauth);
-      if (needsReauth) throw new FreeeNeedsReauthError();
-      throw error;
+    } catch {
+      // 結果が分からない（freee 側で使用済みになったかもしれない）ので、同じトークンは二度と送らない
+      await deps.store.failRefresh(customerId, owner, true).catch(() => undefined);
+      throw new FreeeNeedsReauthError();
     }
     try {
       await deps.store.completeRefresh(customerId, owner, tokens);
-    } catch (error) {
-      throw new FreeeRefreshNotSavedError(error);
+    } catch {
+      // 新しいトークンを失った。ロックの期限が切れれば DB が再認可待ちにするが、できるならここで明示する
+      await deps.store.failRefresh(customerId, owner, true).catch(() => undefined);
+      throw new FreeeRefreshNotSavedError();
     }
     return { accessToken: tokens.accessToken, companyId: first.companyId };
   }

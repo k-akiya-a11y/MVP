@@ -138,7 +138,7 @@ describe("freee のトークン更新のロック", () => {
     });
   });
 
-  it("期限切れのロックは次の処理が引き継げる。古い所有者は保存できない", async () => {
+  it("期限切れのロックが残っていたら（前の更新の結果が不明）、同じトークンを渡さず再認可待ちにする。古い所有者も保存できない", async () => {
     await client.query("begin");
     try {
       await client.query("set local role service_role");
@@ -150,7 +150,9 @@ describe("freee のトークン更新のロック", () => {
       ]);
       await client.query("set local role service_role");
       const taken = await client.query("select * from public.begin_freee_token_refresh($1, $2, 60)", [CUSTOMER_A, OWNER_2]);
-      expect(taken.rowCount).toBe(1);
+      expect(taken.rows).toEqual([]);
+      const s = await client.query("select status, refresh_lock_owner from public.freee_connections where customer_id = $1", [CUSTOMER_A]);
+      expect(s.rows[0]).toEqual({ status: "needs_reauth", refresh_lock_owner: null });
       expect(
         await expectQueryError(client, "select public.complete_freee_token_refresh($1, $2, 'x', 'y', now())", [CUSTOMER_A, OWNER_1]),
       ).toContain("ロックを持っていません");

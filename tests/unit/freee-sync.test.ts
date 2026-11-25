@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { freeeReadApi, type FreeeDeal, type FreeeWalletTxn } from "@/lib/freee/api";
 import {
+  FreeeSyncStuckError,
   masterRows,
   monthEnd,
   pastEntryRows,
@@ -169,11 +170,21 @@ describe("過去仕訳の取込（月ごとに書き、進み具合を一緒に�
     const f = freee({ "2026-08-01": [deal(1)], "2026-09-01": [deal(2, { issue_date: "2026-09-01" })] });
     // 8月: 取引1 + 口座明細1 = 2回。9月の取引で3回目、口座明細の4回目で上限
     const api = freeeReadApi({ fetch: f.fetch, counter: { calls: 0, limit: 3 } });
-    await expect(
-      syncFreeePastEntries({ customerId: "c", companyId: 900001, accessToken: "t", api, store: m.store, today: "2026-10-20" }),
-    ).rejects.toThrow("上限");
+    const r = await syncFreeePastEntries({ customerId: "c", companyId: 900001, accessToken: "t", api, store: m.store, today: "2026-10-20" });
+    expect(r).toMatchObject({ months: 1, done: false, stoppedByCallLimit: true, nextMonth: "2026-09-01" });
     expect(m.written).toHaveLength(1);
     expect(m.state.nextMonth).toBe("2026-09-01");
+  });
+
+  it("1か月分が残りの予算に収まらず1か月も進めなければ、失敗にする（毎回同じ月を読み直して完了と返さない）", async () => {
+    const m = memoryStore({ from: "2026-08-01", until: "2026-10-01", nextMonth: "2026-08-01" });
+    const f = freee({ "2026-08-01": [deal(1)] });
+    const api = freeeReadApi({ fetch: f.fetch, counter: { calls: 0, limit: 1 } });
+    await expect(
+      syncFreeePastEntries({ customerId: "c", companyId: 900001, accessToken: "t", api, store: m.store, today: "2026-10-20" }),
+    ).rejects.toBeInstanceOf(FreeeSyncStuckError);
+    expect(m.written).toHaveLength(0);
+    expect(m.state.nextMonth).toBe("2026-08-01");
   });
 
   it("マスタを同期する前は取り込まない（取引先名から取引先キーを作れないため）", async () => {

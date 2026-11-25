@@ -13,6 +13,11 @@ import type { FetchLike } from "./api";
 
 export const FREEE_AUTHORIZE_URL = "https://accounts.secure.freee.co.jp/public_api/authorize";
 export const FREEE_TOKEN_URL = "https://accounts.secure.freee.co.jp/public_api/token";
+/**
+ * トークンの発行・更新を待つ上限。トークン更新のロック（REFRESH_LOCK_SECONDS = 60 秒）より十分短くし、
+ * ロックの期限内に「保存」か「失敗の記録」まで終える（期限が切れたロックは、DB が結果不明として再認可待ちにする）
+ */
+export const TOKEN_REQUEST_TIMEOUT_MS = 20_000;
 
 export type FreeeOAuthConfig = { clientId: string; clientSecret: string; redirectUri: string };
 
@@ -67,6 +72,7 @@ async function requestToken(
   const now = deps.now ?? Date.now;
   const res = await doFetch(FREEE_TOKEN_URL, {
     method: "POST",
+    signal: AbortSignal.timeout(TOKEN_REQUEST_TIMEOUT_MS),
     headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
     body: new URLSearchParams({ ...params, client_id: config.clientId, client_secret: config.clientSecret }).toString(),
   });

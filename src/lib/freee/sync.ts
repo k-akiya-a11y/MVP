@@ -1,5 +1,20 @@
 import { partnerKey } from "../retrieval/normalize";
-import type { FreeeDeal, FreeeMasters, FreeeReadApi, FreeeWalletTxn } from "./api";
+import { FreeeCallBudgetExceeded, type FreeeDeal, type FreeeMasters, type FreeeReadApi, type FreeeWalletTxn } from "./api";
+
+/** マスタを同期する前に過去仕訳を取り込もうとした */
+export class FreeeMastersNotSyncedError extends Error {
+  constructor() {
+    super("先にマスタを同期してください（取引先名から取引先キーを作るため）");
+  }
+}
+/** 残りの呼出し回数では1か月分も取り込めず、この実行では1か月も進めなかった（成功扱いにしない） */
+export class FreeeSyncStuckError extends Error {
+  constructor(month: string) {
+    super(
+      `${month.slice(0, 7)} の1か月分の取込が、この実行の呼出しの上限に収まりませんでした。1か月も進めていません（上限の見直しか、月の分割が必要です）`,
+    );
+  }
+}
 
 /**
  * freee からの読み取り同期（設計書3章: マスタは1日1回、過去仕訳は初回に24か月分、以降は差分）。
@@ -221,6 +236,7 @@ export async function syncFreeeMasters(args: {
 /**
  * 過去仕訳を月単位で取り込む。1か月分（取引と、摘要を探す口座明細）を読み終えてから、その月の行と「次の月」を同じトランザクションで書く。
  * 呼出しの予算（api の CallCounter）を使い切ったら、その月は書かずに止める（次回、同じ月から続ける）。
+ * 1か月も書けないまま予算が尽きたら、前に進めないので FreeeSyncStuckError にする（毎回同じ月を読み直して「完了」と返さない）。
  */
 export async function syncFreeePastEntries(args: {
   customerId: string;
@@ -232,9 +248,7 @@ export async function syncFreeePastEntries(args: {
   maxMonths?: number;
 }) {
   const state = await args.store.loadPastEntryState(args.customerId);
-  if (!state.mastersSyncedAt) {
-    throw new Error("先にマスタを同期してください（取引先名から取引先キーを作るため）");
-  }
+  if (!state.mastersSyncedAt) throw new FreeeMastersNotSyncedError();
   const partnerNames = await args.store.loadPartnerNames(args.customerId);
   const range = planPastEntryRange(state, args.today);
   const total: PastEntryCounts & { months: number } = {
@@ -248,10 +262,18 @@ export async function syncFreeePastEntries(args: {
   let month = range.nextMonth;
   const maxMonths = args.maxMonths ?? Number.POSITIVE_INFINITY;
   while (month <= range.until && total.months < maxMonths) {
-    const deals = await args.api.deals(args.accessToken, args.companyId, month, monthEnd(month));
+    let deals: FreeeDeal[];
     const txns: FreeeWalletTxn[] = [];
-    for (const w of walletWindows(deals)) {
-      txns.push(...(await args.api.walletTxns(args.accessToken, args.companyId, { type: w.type, id: w.id }, w.from, w.to)));
+    try {
+      deals = await args.api.deals(args.accessToken, args.companyId, month, monthEnd(month));
+      for (const w of walletWindows(deals)) {
+        txns.push(...(await args.api.walletTxns(args.accessToken, args.companyId, { type: w.type, id: w.id }, w.from, w.to)));
+      }
+    } catch (error) {
+      if (!(error instanceof FreeeCallBudgetExceeded)) throw error;
+      if (total.months === 0) throw new FreeeSyncStuckError(month);
+      // 書き終えた月までは保存済み。この月から次回続ける
+      return { ...total, done: false, stoppedByCallLimit: true, nextMonth: month };
     }
     const { rows, counts } = pastEntryRows(deals, txns, partnerNames);
     const next = addMonths(month, 1);
@@ -267,5 +289,5 @@ export async function syncFreeePastEntries(args: {
     for (const k of ["deals", "upserted", "skipped_multi_line", "skipped_non_positive", "wallet_txn_matched"] as const) total[k] += counts[k];
     month = next;
   }
-  return { ...total, done: month > range.until };
+  return { ...total, done: month > range.until, stoppedByCallLimit: false, nextMonth: month > range.until ? null : month };
 }

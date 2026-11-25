@@ -92,10 +92,49 @@ describe("freee の同期の実行（1顧客）", () => {
     ]);
   });
 
-  it("呼出しの上限に達したら、過去仕訳は失敗にせず、続きを次回に回す", async () => {
+  it("1か月以上進んでから呼出しの上限に達したら、過去仕訳は失敗にせず、続きを次回に回す", async () => {
     const { d } = deps(mastersRoutes);
+    d.syncStore.loadPastEntryState = async () => ({
+      from: "2026-09-01",
+      until: "2026-10-01",
+      nextMonth: "2026-09-01",
+      completed: false,
+      mastersSyncedAt: "x",
+    });
+    // マスタ 6 回 + 9月の取引 1 回。10月の取引で上限
+    const r = await runFreeeSync(C, { ...d, callLimit: 7 });
+    expect(r.results.past_entries).toMatchObject({
+      status: "completed",
+      counts: { months: 1, stoppedByCallLimit: true, nextMonth: "2026-10-01" },
+    });
+  });
+
+  it("上限のせいで1か月も進めなければ、過去仕訳は失敗として記録する（前進しないまま完了にしない）", async () => {
+    const { runs, d } = deps(mastersRoutes);
     const r = await runFreeeSync(C, { ...d, callLimit: 6 });
     expect(r.results.masters.status).toBe("completed");
-    expect(r.results.past_entries).toMatchObject({ status: "completed", counts: { stopped_by_call_limit: true } });
+    expect(r.results.past_entries).toMatchObject({ status: "failed", error: expect.stringContaining("1か月も進めていません") });
+    expect(runs[1]!.result).toMatchObject({ status: "failed" });
+  });
+
+  it("外部や DB のエラー文に秘密の値が入っていても、同期の結果と記録には固定の文言しか残さない", async () => {
+    const SECRET = "SECRET-token-0123456789";
+    const { runs, d } = deps(mastersRoutes);
+    d.syncStore.syncMasters = async () => {
+      throw new Error("db said " + SECRET);
+    };
+    const r1 = await runFreeeSync(C, d);
+    expect(JSON.stringify([r1, runs])).not.toContain(SECRET);
+    expect(r1.results.masters.error).toBe("同期中に想定外のエラーが起きました");
+
+    const { runs: runs2, d: d2 } = deps(mastersRoutes);
+    const base = d2.fetch;
+    const failingFetch = async (input: string, init?: RequestInit) => {
+      if (input.includes("/api/1/deals")) throw new TypeError("fetch failed " + SECRET);
+      return base(input, init);
+    };
+    const r2 = await runFreeeSync(C, { ...d2, fetch: failingFetch });
+    expect(r2.results.past_entries).toMatchObject({ status: "failed", error: "同期中に想定外のエラーが起きました" });
+    expect(JSON.stringify([r2, runs2])).not.toContain(SECRET);
   });
 });

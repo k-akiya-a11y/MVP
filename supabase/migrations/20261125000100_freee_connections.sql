@@ -156,7 +156,9 @@ as $$
 $$;
 
 -- トークン更新のロックを取る。取れたらリフレッシュトークンを返す。
--- 他の処理がロック中（期限内）なら0行（呼出し側は待ってからアクセストークンを読み直す）。再認可待ち・未接続なら例外
+-- 他の処理がロック中（期限内）なら0行（呼出し側は待ってからアクセストークンを読み直す）。再認可待ち・未接続なら例外。
+-- 期限が切れたロックが残っていれば、前の処理は freee に更新を送ったまま結果を保存できなかった（応答の喪失・処理の停止）可能性がある。
+-- 使い捨てのリフレッシュトークンを二重に送らないよう、引き継がずに「再認可が必要」にして止める
 create function public.begin_freee_token_refresh(p_customer_id uuid, p_owner uuid, p_lock_seconds integer)
 returns table (refresh_token text)
 language plpgsql
@@ -177,6 +179,13 @@ begin
     raise exception 'freee との接続の再認可が必要です';
   end if;
   if v_conn.refresh_lock_owner is not null and v_conn.refresh_lock_until > now() and v_conn.refresh_lock_owner <> p_owner then
+    return;
+  end if;
+  if v_conn.refresh_lock_owner is not null and v_conn.refresh_lock_until <= now() then
+    update public.freee_connections
+    set status = 'needs_reauth', refresh_lock_owner = null, refresh_lock_until = null
+    where customer_id = p_customer_id;
+    -- 例外にすると上の update も取り消されるため、状態だけを変えて0行を返す（呼出し側は読み直して再認可待ちを知る）
     return;
   end if;
   update public.freee_connections
