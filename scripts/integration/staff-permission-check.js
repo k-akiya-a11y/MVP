@@ -251,6 +251,39 @@
   await unauthenticatedApp("U-6", "アプリの取込 API（cookie なし）", `/api/customers/${CUSTOMER_A}/statements`, { method: "POST", body: form2 });
   await unauthenticatedApp("U-7", "候補生成 API（CRON_SECRET なし）", "/api/cron/propose", {});
 
+  // ---- 仕訳候補ジョブ用の関数・表（service_role だけ。20261024000100_proposal_scan_cursor.sql） ----
+  // もし通ってしまった場合は貸出しが作られうるが、FAIL として表示する（期限 600 秒で切れる）
+  // 引数名を誤ると「関数が見つからない」（404）でも 400 番台になり誤って PASS になるため、権限の拒否の文言まで確かめる
+  const DENIED = ["permission denied"];
+  const FAKE_OWNER = "00000000-0000-4000-8000-00000000f00d";
+  r = await rpc("claim_pending_proposal_batch", { p_limit: 1, p_owner: FAKE_OWNER, p_lease_seconds: 60 });
+  record("P-1", "担当者", "候補ジョブの貸出し（claim_pending_proposal_batch）", "拒否", r, rejected(r, DENIED));
+  r = await rpc("renew_proposal_claim", { p_bank_transaction_id: CUSTOMER_A, p_owner: FAKE_OWNER, p_lease_seconds: 60 });
+  record("P-2", "担当者", "貸出しの延長（renew_proposal_claim）", "拒否", r, rejected(r, DENIED));
+  r = await rpc("release_proposal_claims", { p_owner: FAKE_OWNER, p_ids: [CUSTOMER_A] });
+  record("P-3", "担当者", "貸出しの返却（release_proposal_claims）", "拒否", r, rejected(r, DENIED));
+  r = await rpc("record_claimed_ai_decision", { p_owner: FAKE_OWNER, p_decision: {} });
+  record("P-4", "担当者", "貸出し経由の判断の記録（record_claimed_ai_decision）", "拒否", r, rejected(r, DENIED));
+  r = await select("proposal_leases?select=bank_transaction_id&limit=1");
+  record("P-5", "担当者", "貸出しの表を SELECT", "拒否", r, rejected(r, DENIED));
+  r = await select("proposal_scan_cursor?select=*&limit=1");
+  record("P-6", "担当者", "走査位置の表を SELECT", "拒否", r, rejected(r, DENIED));
+
+  // ---- 保留中の明細への再保留（20261105041046_reject_duplicate_hold.sql）。保留中の明細があるときだけ ----
+  const onHoldIds = (open.json || []).filter((t) => t.status === "on_hold").map((t) => t.id);
+  if (onHoldIds.length) {
+    const held = await select(`latest_ai_decisions?select=id&bank_transaction_id=eq.${onHoldIds[0]}`);
+    const heldDecision = held.json && held.json[0];
+    if (heldDecision) {
+      r = await rpc("record_human_review", {
+        p_ai_decision_id: heldDecision.id, p_action: "hold", p_final_entry: null, p_reason: "権限確認（再保留）", p_review_seconds: 1, p_bulk: false,
+      });
+      record("S-20", "担当者", "保留中の明細をもう一度保留（RPC）", "拒否（すでに保留中）", r, rejected(r, ["すでに保留中です"]));
+    }
+  } else {
+    results.push({ id: "S-20", who: "担当者", operation: "保留中の明細をもう一度保留", expected: "-", http: "-", actual: "保留中の明細がないため実行せず（段階12の手順で先に1件保留にする）", result: "SKIP" });
+  }
+
   // ---- 実行後の状態が変わっていないこと ----
   const after = await snapshot();
   const same = (k) => before[k] === after[k];
