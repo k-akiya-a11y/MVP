@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createClient } from "@supabase/supabase-js";
 import { describe, expect, it } from "vitest";
 import { runProposalJob } from "@/lib/proposals/run";
@@ -11,8 +11,11 @@ import { MOCK_MODEL, mockJournalAi } from "./mock-journal-ai";
  *
  * 実行: VERIFY_PROJECT_REF=<検証用プロジェクトの Reference ID> npm run verify:mock-propose
  * - 接続先とキーは .env.local の NEXT_PUBLIC_SUPABASE_URL と SUPABASE_SERVICE_ROLE_KEY（本人が直接入力。チャットに貼らない）
- * - VERIFY_PROJECT_REF が URL の Reference ID と一致しないと止める（取り違えて別のプロジェクトにつながないため）
- * - DB の顧客が架空データ（seed と tests/fixtures/verification）の ID だけでないと止める（本物の顧客がいる DB では動かさない）
+ * - 接続する前に、URL の Reference ID が scripts/integration/verification-projects.json（PR でレビューした検証専用の一覧）にあり、
+ *   VERIFY_PROJECT_REF とも一致することを確かめる。どちらかが違えば接続しない
+ *   （.env.local より起動元の環境変数が優先されるため、どこから来た値でもこの照合を通らなければ止まる）
+ * - 接続後、キーが service_role であること（RLS で一部の行しか見えないキーでないこと）を確かめてから、
+ *   顧客の表の全行を数え、架空データ（seed と tests/fixtures/verification）以外の ID が1件でもあれば止める
  * - 値は表示しない。表示するのは接続先の Reference ID と結果の件数だけ
  */
 
@@ -35,14 +38,27 @@ describe.runIf(enabled)("検証用 Supabase で候補生成ジョブを偽のモ
     const match = /^https:\/\/([a-z0-9]+)\.supabase\.co$/.exec(url);
     expect(match, "NEXT_PUBLIC_SUPABASE_URL は https://<Reference ID>.supabase.co の形にしてください").not.toBeNull();
     const ref = match![1];
+    const allowlist = JSON.parse(readFileSync("scripts/integration/verification-projects.json", "utf8")) as { allowedProjectRefs: unknown };
+    const allowed = Array.isArray(allowlist.allowedProjectRefs) ? allowlist.allowedProjectRefs : [];
+    expect(allowed, "接続先が検証専用の一覧（scripts/integration/verification-projects.json）にありません。接続しません").toContain(ref);
     expect(ref, "VERIFY_PROJECT_REF が接続先の Reference ID と一致しません").toBe(process.env.VERIFY_PROJECT_REF);
     expect(key, "SUPABASE_SERVICE_ROLE_KEY が設定されていません").not.toBe("");
 
+    // ここで初めて接続する
     const client = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
-    const { data: customers, error } = await client.from("customers").select("id");
-    expect(error).toBeNull();
-    const unknown = (customers ?? []).filter((c: { id: string }) => !FIXTURE_CUSTOMER_IDS.has(c.id));
-    expect(unknown.length, "架空データ以外の顧客があります。本物の顧客がいる DB では実行しません").toBe(0);
+    // service_role だけが読める表を読めるか（anon などのキーだと RLS で顧客の一部しか見えず、下の照合が全行にならない）
+    const lease = await client.from("proposal_leases").select("bank_transaction_id", { count: "exact", head: true });
+    expect(lease.error, "SUPABASE_SERVICE_ROLE_KEY が service_role のキーではありません").toBeNull();
+    // 顧客の表の全行を DB で数える（取得件数の上限に左右されない）
+    const all = await client.from("customers").select("id", { count: "exact", head: true });
+    const others = await client
+      .from("customers")
+      .select("id", { count: "exact", head: true })
+      .not("id", "in", `(${[...FIXTURE_CUSTOMER_IDS].join(",")})`);
+    expect(all.error).toBeNull();
+    expect(others.error).toBeNull();
+    expect(all.count, "顧客の件数を数えられません").not.toBeNull();
+    expect(others.count, "架空データ以外の顧客があります。本物の顧客がいる DB では実行しません").toBe(0);
 
     const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Tokyo" });
     const result = await runProposalJob({ store: supabaseProposalStore(client), ai: mockJournalAi, today });

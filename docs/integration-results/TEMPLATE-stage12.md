@@ -12,7 +12,8 @@
 | 実行場所 | 手元の PC（`npm run build` → `npm start`、http://localhost:3000） |
 | Supabase | 検証用プロジェクト（Reference ID の先頭4文字: ）。新規／使い回し（使い回しなら `stage12-reconcile.sql` の since: ） |
 | 候補生成 | 偽のモデル（`mock/`）。Claude API は呼んでいない |
-| `check-env.mjs` | OK／NG |
+| 起動前チェック（`npm run verify:start`） | OK／NG |
+| `verification-projects.json` に追加した PR | |
 | 操作した人 | 管理者: ／担当者（テスト用アカウント）: |
 
 ## 通し操作（12-2）
@@ -24,9 +25,9 @@
 | 3 | | `verify:mock-propose` の出力（processed・byConfidence・failures）: |
 | 4 | | |
 | 5 | | |
-| 6 | | |
+| 6 | | 権限確認スクリプトの FAIL の件数: 、SKIP の件数と理由: |
 | 7 | | |
-| 8 | | FAIL の件数: 、SKIP の件数と理由: |
+| 8 | | |
 | 9 | | ok = false の項目: |
 | 10 | | |
 

@@ -324,7 +324,7 @@ PR #4（ブランチ `fix/csv-integrity-and-proposal-hold`）で増えた変更�
 - **手元の PC で動かす。** このブランチは Vercel のデプロイを止めているため（[deployment-hold.md](deployment-hold.md)）、Vercel の設定は変えずに、手元で本番ビルド（`npm run build` → `npm start`）を動かします。
 - **Claude API は呼ばない。** 費用がかかる確認は保留中のため、候補生成は**検証用の偽のモデル**（`tests/integration/mock-journal-ai.ts`）で動かします。偽のモデルは過去仕訳の多数派をそのまま返すだけなので、精度の評価には使いません。判断ログの `model` は `mock/` で始まり、費用は0です。
 - **`.env.local` の `ANTHROPIC_API_KEY` と `CRON_SECRET` は空にする。** `CRON_SECRET` が空なら `/api/cron/propose` は必ず 401 になり、誤って呼んでも本物の AI に届きません。
-- **本番の環境・本物の顧客のデータには触らない。** 偽のモデルのスクリプトは、接続先の顧客が架空データ（seed と検証用商事）の ID だけでないと止まります。
+- **本番の環境・本物の顧客のデータには触らない。** 偽のモデルのスクリプトは、接続する前に接続先が検証専用の一覧（`scripts/integration/verification-projects.json`、PR でレビューして追加）にあることを確かめ、接続後は service_role のキーで顧客の表の全行を数えて、架空データ（seed と検証用商事）以外の顧客が1件でもあれば止まります。
 
 秘密の値（キー・シークレット）は、本人が `.env.local` と Supabase・Google Cloud の設定画面に直接入れます。チャット・PR・このファイルには書きません。
 
@@ -337,9 +337,10 @@ PR #4（ブランチ `fix/csv-integrity-and-proposal-hold`）で増えた変更�
 | 3 | seed（`supabase/seed/001_sample_customer.sql`）と `tests/fixtures/verification/verification_customer.sql` を SQL Editor で実行する（使い回す場合は済んでいれば不要） | `customers` が3行 |
 | 4 | Google Cloud の OAuth クライアント（段階4-1）の Authorized JavaScript origins に `http://localhost:3000` を追加する | — |
 | 5 | Supabase の Authentication → URL Configuration（段階4-3）で、Site URL を `http://localhost:3000` にし、Redirect URLs に `http://localhost:3000/auth/callback` を追加する | — |
-| 6 | `cp .env.example .env.local` で作り、`NEXT_PUBLIC_SUPABASE_URL`・`NEXT_PUBLIC_SUPABASE_ANON_KEY`・`SUPABASE_SERVICE_ROLE_KEY`・`ALLOWED_LOGIN_DOMAIN` を自分で入力する。`ANTHROPIC_API_KEY` と `CRON_SECRET` は空のまま | `node scripts/integration/check-env.mjs` が OK（値は表示されない） |
-| 7 | `npm install` → `npm run build` → `npm start` | `http://localhost:3000` でログイン画面が出る |
-| 8 | 管理者と担当者（テスト用アカウント）で、別々のブラウザ（または Chrome の別プロファイル）からログインし、段階6〜8 と同じ手順で役割と担当顧客を登録する | 担当者にはサンプル商事だけ、管理者には3社が見える |
+| 6 | 検証用プロジェクトの Reference ID（URL の `https://<ここ>.supabase.co`。秘密ではない）を `scripts/integration/verification-projects.json` の `allowedProjectRefs` に追加する PR を出し、レビューで本番のプロジェクトでないことを確かめてからマージする | 一覧が空のあいだは、起動前チェックと偽のモデルのスクリプトが必ず止まる |
+| 7 | `cp .env.example .env.local` で作り、`NEXT_PUBLIC_SUPABASE_URL`・`NEXT_PUBLIC_SUPABASE_ANON_KEY`・`SUPABASE_SERVICE_ROLE_KEY`・`ALLOWED_LOGIN_DOMAIN` を自分で入力する。`ANTHROPIC_API_KEY` と `CRON_SECRET` は空のまま。起動するシェルにもこれらの値が残っていないこと（起動元の環境変数は `.env.local` より優先される） | — |
+| 8 | `npm install` → `npm run build` → `npm run verify:start`（`npm start` は使わない） | 起動前チェック（`scripts/integration/check-env.mjs`）が実効値で OK を出してから起動し、`http://localhost:3000` でログイン画面が出る。NG なら起動しない（値は表示されない） |
+| 9 | 管理者と担当者（テスト用アカウント）で、別々のブラウザ（または Chrome の別プロファイル）からログインし、段階6〜8 と同じ手順で役割と担当顧客を登録する | 担当者にはサンプル商事だけ、管理者には3社が見える |
 
 ### 12-2. 通し操作（ブラウザ）
 
@@ -350,9 +351,9 @@ PR #4（ブランチ `fix/csv-integrity-and-proposal-hold`）で増えた変更�
 | 3 | Ken | 偽のモデルで候補生成を1回動かす: `VERIFY_PROJECT_REF=<Reference ID> npm run verify:mock-propose`（PowerShell では `$env:VERIFY_PROJECT_REF="<Reference ID>"; npm run verify:mock-propose`） | `failures` が空。表示されるモデルが `mock/` で始まる |
 | 4 | 担当者 | 承認画面で1件に理由を入れて保留する。別のタブで同じ画面を開いたまま、もう一度保留を押す | 1回目は保留タブに移る。2回目は「この明細はすでに保留中です」で拒否され、確認ログは増えない |
 | 5 | 担当者 | 承認・修正・却下・まとめて承認のボタンがないことを確かめる | 操作できない |
-| 6 | 管理者 | 保留した明細を承認し、「高」をまとめて承認、別の1件を修正、別の1件を却下する | それぞれ記録され、承認・修正した内容が過去仕訳に加わる |
-| 7 | 管理者 | 「確認の履歴を見る」「取り込んだ明細の一覧を見る」（絞り込みも1回試す）を開く | 6 の操作が履歴に並ぶ。明細の状態が操作どおり |
-| 8 | 担当者 | ブラウザの開発者ツールで `scripts/integration/staff-permission-check.js` を実行する（段階10-2 と同じ） | FAIL が0件。P-1〜P-6（候補ジョブ用の関数・表）と S-20（再保留）を含む。S-19（実行前後の比較）が PASS |
+| 6 | 担当者 | **4 の保留を管理者が確定する前に**、ブラウザの開発者ツールで `scripts/integration/staff-permission-check.js` を実行する（段階10-2 と同じ） | FAIL が0件。P-1〜P-6（候補ジョブ用の関数・表）と S-20（保留中の明細の再保留）を含む。保留中の明細が見つからないと S-20 は FAIL になる。S-19（実行前後の比較）が PASS |
+| 7 | 管理者 | 保留した明細を承認し、「高」をまとめて承認、別の1件を修正、別の1件を却下する | それぞれ記録され、承認・修正した内容が過去仕訳に加わる |
+| 8 | 管理者 | 「確認の履歴を見る」「取り込んだ明細の一覧を見る」（絞り込みも1回試す）を開く | 7 の操作が履歴に並ぶ。明細の状態が操作どおり |
 | 9 | Ken | SQL Editor で `scripts/integration/sql/stage12-reconcile.sql` を実行する | R-1〜R-8 がすべて `ok = true` |
 | 10 | Ken | 段階9のログ照合 E（追記専用）を1つずつ試す | どれもエラーで拒否される |
 

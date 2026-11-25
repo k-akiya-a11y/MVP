@@ -256,7 +256,8 @@
   // 引数名を誤ると「関数が見つからない」（404）でも 400 番台になり誤って PASS になるため、権限の拒否の文言まで確かめる
   const DENIED = ["permission denied"];
   const FAKE_OWNER = "00000000-0000-4000-8000-00000000f00d";
-  r = await rpc("claim_pending_proposal_batch", { p_limit: 1, p_owner: FAKE_OWNER, p_lease_seconds: 60 });
+  // p_limit: 0 なら、誤って実行権が付いていても関数は位置にも貸出しにも触れずに戻る
+  r = await rpc("claim_pending_proposal_batch", { p_limit: 0, p_owner: FAKE_OWNER, p_lease_seconds: 60 });
   record("P-1", "担当者", "候補ジョブの貸出し（claim_pending_proposal_batch）", "拒否", r, rejected(r, DENIED));
   r = await rpc("renew_proposal_claim", { p_bank_transaction_id: CUSTOMER_A, p_owner: FAKE_OWNER, p_lease_seconds: 60 });
   record("P-2", "担当者", "貸出しの延長（renew_proposal_claim）", "拒否", r, rejected(r, DENIED));
@@ -269,19 +270,30 @@
   r = await select("proposal_scan_cursor?select=*&limit=1");
   record("P-6", "担当者", "走査位置の表を SELECT", "拒否", r, rejected(r, DENIED));
 
-  // ---- 保留中の明細への再保留（20261105041046_reject_duplicate_hold.sql）。保留中の明細があるときだけ ----
-  const onHoldIds = (open.json || []).filter((t) => t.status === "on_hold").map((t) => t.id);
-  if (onHoldIds.length) {
-    const held = await select(`latest_ai_decisions?select=id&bank_transaction_id=eq.${onHoldIds[0]}`);
-    const heldDecision = held.json && held.json[0];
-    if (heldDecision) {
+  // ---- 保留中の明細への再保留（20261105041046_reject_duplicate_hold.sql） ----
+  // 段階12-2 の 4（担当者が1件保留）の直後、管理者が確定する前に実行する。保留中の明細や判断が見つからなければ FAIL にする（SKIP にしない）
+  {
+    const onHoldIds = (open.json || []).filter((t) => t.status === "on_hold").map((t) => t.id);
+    const held = onHoldIds.length
+      ? await select(`latest_ai_decisions?select=id&bank_transaction_id=eq.${onHoldIds[0]}`)
+      : null;
+    const heldDecision = held && held.status === 200 && Array.isArray(held.json) ? held.json[0] : null;
+    if (!heldDecision) {
+      results.push({
+        id: "S-20", who: "担当者", operation: "保留中の明細をもう一度保留", expected: "拒否（すでに保留中）", http: held ? held.status : "-",
+        actual: open.status !== 200
+          ? `明細を読めませんでした（HTTP ${open.status}）`
+          : onHoldIds.length
+            ? "保留中の明細の判断ログを読めませんでした"
+            : "保留中の明細がありません（段階12-2 の 4 で保留した直後、管理者が確定する前に実行してください）",
+        result: "FAIL",
+      });
+    } else {
       r = await rpc("record_human_review", {
         p_ai_decision_id: heldDecision.id, p_action: "hold", p_final_entry: null, p_reason: "権限確認（再保留）", p_review_seconds: 1, p_bulk: false,
       });
       record("S-20", "担当者", "保留中の明細をもう一度保留（RPC）", "拒否（すでに保留中）", r, rejected(r, ["すでに保留中です"]));
     }
-  } else {
-    results.push({ id: "S-20", who: "担当者", operation: "保留中の明細をもう一度保留", expected: "-", http: "-", actual: "保留中の明細がないため実行せず（段階12の手順で先に1件保留にする）", result: "SKIP" });
   }
 
   // ---- 実行後の状態が変わっていないこと ----

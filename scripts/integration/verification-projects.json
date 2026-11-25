@@ -1,0 +1,4 @@
+{
+  "説明": "段階12で接続してよい検証専用の Supabase プロジェクトの Reference ID（URL の https://<ここ>.supabase.co）。本番のプロジェクトは絶対に入れない。追加・変更は PR で行い、レビューで本番でないことを確かめる。Reference ID は URL に出る値で、秘密ではない（キーは入れない）。空のあいだは check-env.mjs と verify:mock-propose が必ず止まる",
+  "allowedProjectRefs": []
+}
