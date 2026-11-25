@@ -316,3 +316,52 @@ where id = (select id from public.human_reviews order by created_at limit 1);
 | 6 | Ken | SQL Editor で `proposals-verification.sql` を実行し、結果を CSV でこのスレッドに貼る | 12行 |
 
 結果は README の期待結果と突き合わせ、「候補生成の成功」「期待値との一致（確定項目のみ）」「業務判断が未確定（集計しない）」の3つに分けて `docs/integration-results/` に記録します。
+
+## 段階12. PR #4 の版での再確認（手元の PC、Claude API は呼ばない）
+
+PR #4（ブランチ `fix/csv-integrity-and-proposal-hold`）で増えた変更を、本物の Supabase・Google ログイン・ブラウザで通します。段階1〜11 との違いは次の4つです。
+
+- **手元の PC で動かす。** このブランチは Vercel のデプロイを止めているため（[deployment-hold.md](deployment-hold.md)）、Vercel の設定は変えずに、手元で本番ビルド（`npm run build` → `npm start`）を動かします。
+- **Claude API は呼ばない。** 費用がかかる確認は保留中のため、候補生成は**検証用の偽のモデル**（`tests/integration/mock-journal-ai.ts`）で動かします。偽のモデルは過去仕訳の多数派をそのまま返すだけなので、精度の評価には使いません。判断ログの `model` は `mock/` で始まり、費用は0です。
+- **`.env.local` の `ANTHROPIC_API_KEY` と `CRON_SECRET` は空にする。** `CRON_SECRET` が空なら `/api/cron/propose` は必ず 401 になり、誤って呼んでも本物の AI に届きません。
+- **本番の環境・本物の顧客のデータには触らない。** 偽のモデルのスクリプトは、接続先の顧客が架空データ（seed と検証用商事）の ID だけでないと止まります。
+
+秘密の値（キー・シークレット）は、本人が `.env.local` と Supabase・Google Cloud の設定画面に直接入れます。チャット・PR・このファイルには書きません。
+
+### 12-1. 準備（k-aki）
+
+| # | 操作 | 確認 |
+| --- | --- | --- |
+| 1 | 検証専用の Supabase プロジェクトを用意する。新しく作るのがおすすめ（10月の検証用を使い回す場合は、本物の顧客のデータが入っていないことを確かめる） | 本番のプロジェクトとは別のもの |
+| 2 | マイグレーションをすべて適用する（段階1-2 と同じ。使い回す場合は `20261024000100_proposal_scan_cursor.sql`・`20261105041046_reject_duplicate_hold.sql` など未適用の分を名前順に） | Table Editor に `proposal_leases` と `proposal_scan_cursor` がある |
+| 3 | seed（`supabase/seed/001_sample_customer.sql`）と `tests/fixtures/verification/verification_customer.sql` を SQL Editor で実行する（使い回す場合は済んでいれば不要） | `customers` が3行 |
+| 4 | Google Cloud の OAuth クライアント（段階4-1）の Authorized JavaScript origins に `http://localhost:3000` を追加する | — |
+| 5 | Supabase の Authentication → URL Configuration（段階4-3）で、Site URL を `http://localhost:3000` にし、Redirect URLs に `http://localhost:3000/auth/callback` を追加する | — |
+| 6 | `cp .env.example .env.local` で作り、`NEXT_PUBLIC_SUPABASE_URL`・`NEXT_PUBLIC_SUPABASE_ANON_KEY`・`SUPABASE_SERVICE_ROLE_KEY`・`ALLOWED_LOGIN_DOMAIN` を自分で入力する。`ANTHROPIC_API_KEY` と `CRON_SECRET` は空のまま | `node scripts/integration/check-env.mjs` が OK（値は表示されない） |
+| 7 | `npm install` → `npm run build` → `npm start` | `http://localhost:3000` でログイン画面が出る |
+| 8 | 管理者と担当者（テスト用アカウント）で、別々のブラウザ（または Chrome の別プロファイル）からログインし、段階6〜8 と同じ手順で役割と担当顧客を登録する | 担当者にはサンプル商事だけ、管理者には3社が見える |
+
+### 12-2. 通し操作（ブラウザ）
+
+| # | 誰が | 操作 | 期待する結果（合格の基準） |
+| --- | --- | --- | --- |
+| 1 | 担当者 | サンプル商事に `tests/fixtures/statements/bank_generic_sjis.csv` を取り込む。続けて同じファイルをもう一度取り込む | 1回目は5件登録。2回目は5件とも読み飛ばし（二重に登録されない）。取込結果の件数・金額が CSV と一致 |
+| 2 | 担当者 | 同じ顧客の画面で「明細CSVの取込の記録を見る」を開く | 2回分の取込が、読めた行・登録・読み飛ばし・重複の疑いの件数と金額つきで並ぶ |
+| 3 | Ken | 偽のモデルで候補生成を1回動かす: `VERIFY_PROJECT_REF=<Reference ID> npm run verify:mock-propose`（PowerShell では `$env:VERIFY_PROJECT_REF="<Reference ID>"; npm run verify:mock-propose`） | `failures` が空。表示されるモデルが `mock/` で始まる |
+| 4 | 担当者 | 承認画面で1件に理由を入れて保留する。別のタブで同じ画面を開いたまま、もう一度保留を押す | 1回目は保留タブに移る。2回目は「この明細はすでに保留中です」で拒否され、確認ログは増えない |
+| 5 | 担当者 | 承認・修正・却下・まとめて承認のボタンがないことを確かめる | 操作できない |
+| 6 | 管理者 | 保留した明細を承認し、「高」をまとめて承認、別の1件を修正、別の1件を却下する | それぞれ記録され、承認・修正した内容が過去仕訳に加わる |
+| 7 | 管理者 | 「確認の履歴を見る」「取り込んだ明細の一覧を見る」（絞り込みも1回試す）を開く | 6 の操作が履歴に並ぶ。明細の状態が操作どおり |
+| 8 | 担当者 | ブラウザの開発者ツールで `scripts/integration/staff-permission-check.js` を実行する（段階10-2 と同じ） | FAIL が0件。P-1〜P-6（候補ジョブ用の関数・表）と S-20（再保留）を含む。S-19（実行前後の比較）が PASS |
+| 9 | Ken | SQL Editor で `scripts/integration/sql/stage12-reconcile.sql` を実行する | R-1〜R-8 がすべて `ok = true` |
+| 10 | Ken | 段階9のログ照合 E（追記専用）を1つずつ試す | どれもエラーで拒否される |
+
+検証用商事の12件（`tests/fixtures/verification/` の CSV）も、取込 → 3 の候補生成 → `scripts/integration/sql/proposals-verification.sql` で一覧にできます。偽のモデルの結果は精度の評価に使わず、12行が出ることと、取込・候補生成・一覧の経路が通ることだけを確かめます。
+
+### 12-3. 結果の記録
+
+[docs/integration-results/TEMPLATE-stage12.md](integration-results/TEMPLATE-stage12.md) をコピーし、`docs/integration-results/<日付>-stage12.md` に記録します。各項目を「成功」「失敗（内容）」「未確認（理由）」に分けます。
+
+### 保留中: 本物のモデルでの精度・費用・速度（段階11の再実施）
+
+Claude API を呼ぶため、費用をかけてよいと決まるまで行いません。実施するときは、`ANTHROPIC_API_KEY`（利用上限を設定したもの）と `CRON_SECRET` を入れ、段階11と同じ手順で検証用商事の12件を本物のモデルで判定し、`proposals-verification.sql` で集計します。合格の基準（案）は、失敗0件、誤った「高」（`false_high`）0件、確定7件の提案と12件の確信度が2026-10-22の結果から悪化しないこと、すべての呼出しが60秒以内に終わること。費用の上限は Ken が決めます。
