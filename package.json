@@ -14,7 +14,8 @@
     "test": "vitest run --project unit --passWithNoTests",
     "test:db": "vitest run --project db",
     "db:apply": "scripts/apply-migrations.sh",
-    "db:test:local": "scripts/test-db-local.sh"
+    "db:test:local": "scripts/test-db-local.sh",
+    "verify:mock-propose": "vitest run --project integration"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.135.0",

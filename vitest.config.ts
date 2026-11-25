@@ -28,6 +28,15 @@ export default defineConfig({
           environment: "node",
         },
       },
+      {
+        // 実結合の確認用（npm run verify:mock-propose）。npm test には含めない。検証用の Supabase と VERIFY_PROJECT_REF が必要
+        resolve: { alias },
+        test: {
+          name: "integration",
+          include: ["tests/integration/**/*.run.ts"],
+          environment: "node",
+        },
+      },
     ],
   },
 });
