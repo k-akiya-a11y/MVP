@@ -9,7 +9,7 @@
 | 日時（UTC） | |
 | コード（コミット SHA） | |
 | 未コミットの差分 | なし／あり（`git diff` のハッシュ: ） |
-| 実行場所 | 手元の PC（`npm run build` → `npm start`、http://localhost:3000） |
+| 実行場所 | 手元の PC（`npm run verify:start`、http://localhost:3000） |
 | Supabase | 検証用プロジェクト（Reference ID の先頭4文字: ）。新規／使い回し（使い回しなら `stage12-reconcile.sql` の since: ） |
 | 候補生成 | 偽のモデル（`mock/`）。Claude API は呼んでいない |
 | 起動前チェック（`npm run verify:start`） | OK／NG |

@@ -321,7 +321,7 @@ where id = (select id from public.human_reviews order by created_at limit 1);
 
 PR #4（ブランチ `fix/csv-integrity-and-proposal-hold`）で増えた変更を、本物の Supabase・Google ログイン・ブラウザで通します。段階1〜11 との違いは次の4つです。
 
-- **手元の PC で動かす。** このブランチは Vercel のデプロイを止めているため（[deployment-hold.md](deployment-hold.md)）、Vercel の設定は変えずに、手元で本番ビルド（`npm run build` → `npm start`）を動かします。
+- **手元の PC で動かす。** このブランチは Vercel のデプロイを止めているため（[deployment-hold.md](deployment-hold.md)）、Vercel の設定は変えずに、手元で本番ビルドを動かします（`npm run verify:start`。実効値を確かめたのと同じ環境で、ビルドからやり直して起動する）。
 - **Claude API は呼ばない。** 費用がかかる確認は保留中のため、候補生成は**検証用の偽のモデル**（`tests/integration/mock-journal-ai.ts`）で動かします。偽のモデルは過去仕訳の多数派をそのまま返すだけなので、精度の評価には使いません。判断ログの `model` は `mock/` で始まり、費用は0です。
 - **`.env.local` の `ANTHROPIC_API_KEY` と `CRON_SECRET` は空にする。** `CRON_SECRET` が空なら `/api/cron/propose` は必ず 401 になり、誤って呼んでも本物の AI に届きません。
 - **本番の環境・本物の顧客のデータには触らない。** 偽のモデルのスクリプトは、接続する前に接続先が検証専用の一覧（`scripts/integration/verification-projects.json`、PR でレビューして追加）にあることを確かめ、接続後は service_role のキーで顧客の表の全行を数えて、架空データ（seed と検証用商事）以外の顧客が1件でもあれば止まります。
@@ -339,7 +339,7 @@ PR #4（ブランチ `fix/csv-integrity-and-proposal-hold`）で増えた変更�
 | 5 | Supabase の Authentication → URL Configuration（段階4-3）で、Site URL を `http://localhost:3000` にし、Redirect URLs に `http://localhost:3000/auth/callback` を追加する | — |
 | 6 | 検証用プロジェクトの Reference ID（URL の `https://<ここ>.supabase.co`。秘密ではない）を `scripts/integration/verification-projects.json` の `allowedProjectRefs` に追加する PR を出し、レビューで本番のプロジェクトでないことを確かめてからマージする | 一覧が空のあいだは、起動前チェックと偽のモデルのスクリプトが必ず止まる |
 | 7 | `cp .env.example .env.local` で作り、`NEXT_PUBLIC_SUPABASE_URL`・`NEXT_PUBLIC_SUPABASE_ANON_KEY`・`SUPABASE_SERVICE_ROLE_KEY`・`ALLOWED_LOGIN_DOMAIN` を自分で入力する。`ANTHROPIC_API_KEY` と `CRON_SECRET` は空のまま。起動するシェルにもこれらの値が残っていないこと（起動元の環境変数は `.env.local` より優先される） | — |
-| 8 | `npm install` → `npm run build` → `npm run verify:start`（`npm start` は使わない） | 起動前チェック（`scripts/integration/check-env.mjs`）が実効値で OK を出してから起動し、`http://localhost:3000` でログイン画面が出る。NG なら起動しない（値は表示されない） |
+| 8 | `npm install` → `npm run verify:start`（`npm run build`・`npm start` は使わない） | 起動前チェック（`scripts/integration/check-env.mjs`。Next.js と同じローダーで実効値を決める）が OK のときだけ、古い `.next` を消して同じ環境でビルドし直してから起動し、`http://localhost:3000` でログイン画面が出る。NG なら起動しない（値は表示されない）。`NEXT_PUBLIC_` の値はビルドに埋め込まれるため、別の値でビルドした `.next` は使わない |
 | 9 | 管理者と担当者（テスト用アカウント）で、別々のブラウザ（または Chrome の別プロファイル）からログインし、段階6〜8 と同じ手順で役割と担当顧客を登録する | 担当者にはサンプル商事だけ、管理者には3社が見える |
 
 ### 12-2. 通し操作（ブラウザ）

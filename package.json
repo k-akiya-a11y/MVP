@@ -16,7 +16,7 @@
     "db:apply": "scripts/apply-migrations.sh",
     "db:test:local": "scripts/test-db-local.sh",
     "verify:mock-propose": "vitest run --project integration",
-    "verify:start": "node scripts/integration/check-env.mjs && next start"
+    "verify:start": "node scripts/integration/verify-start.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.135.0",

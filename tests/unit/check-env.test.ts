@@ -13,7 +13,7 @@ function run(files: Record<string, string>, env: Record<string, string> = {}) {
   for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
   const base = Object.fromEntries(
     Object.entries(process.env).filter(
-      ([k]) => !/^(NEXT_PUBLIC_SUPABASE_URL|NEXT_PUBLIC_SUPABASE_ANON_KEY|SUPABASE_SERVICE_ROLE_KEY|ALLOWED_LOGIN_DOMAIN|ANTHROPIC_API_KEY|CRON_SECRET)$/.test(k),
+      ([k]) => !/^(NODE_ENV|NEXT_PUBLIC_SUPABASE_URL|NEXT_PUBLIC_SUPABASE_ANON_KEY|SUPABASE_SERVICE_ROLE_KEY|ALLOWED_LOGIN_DOMAIN|ANTHROPIC_API_KEY|CRON_SECRET)$/.test(k),
     ),
   );
   const r = spawnSync(process.execPath, [SCRIPT], { cwd: dir, env: { ...base, ...env } as NodeJS.ProcessEnv, encoding: "utf8" });
@@ -49,6 +49,22 @@ describe("段階12の起動前チェック（check-env.mjs）", () => {
     const r = run({ ".env.local": goodLocal }, { NEXT_PUBLIC_SUPABASE_URL: "https://example.com/rest/v1" });
     expect(r.code).toBe(1);
     expect(r.out).toContain("形が違う");
+  });
+
+  it("Next.js と同じく変数の展開（$VAR）を解決して判定する", () => {
+    const r = run({ ".env.local": `${goodLocal}
+REAL_KEY=${SECRET}
+`.replace("CRON_SECRET=", "CRON_SECRET=$REAL_KEY") });
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/NG: .*CRON_SECRET/);
+    expect(r.out).not.toContain(SECRET);
+  });
+
+  it("NODE_ENV=test が残っていても、本番モードと同じファイル（.env.local）を読む", () => {
+    const r = run({ ".env.local": `${goodLocal.replace("CRON_SECRET=", `CRON_SECRET=${SECRET}`)}
+` }, { NODE_ENV: "test" });
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/NG: .*CRON_SECRET/);
   });
 
   it(".env.production.local の値も実効値として見る（.env.local より優先）", () => {
